@@ -19,7 +19,7 @@ from plugins.base import (
     is_basic_refusal, builtin_dataset_path, has_builtin_dataset,
 )
 from plugins.category import CategoryPlugin
-from plugins.generators import AnthropicGenerator, MistralGenerator, HuggingFaceGenerator, OpenAIGenerator
+from plugins.generators import AnthropicGenerator, BedrockGenerator, MistralGenerator, HuggingFaceGenerator, OpenAIGenerator
 from plugins import (
     prompt_integrity, data_protection, access_control, downstream_injection, rag,
     agentic, jailbreak, harmful_content, criminal, malicious_code, accuracy,
@@ -516,6 +516,7 @@ __all__ = [
     "Generator",
     "ScriptedGenerator",
     "AnthropicGenerator",
+    "BedrockGenerator",
     "MistralGenerator",
     "HuggingFaceGenerator",
     "RedteamPlugin",

@@ -129,9 +129,9 @@ examples:
     tgt = p.add_argument_group("target (system under test)")
     tgt.add_argument(
         "--target-type", "-t", default=None,
-        choices=["rest", "openai", "function"],
+        choices=["rest", "openai", "bedrock", "function"],
         metavar="TYPE",
-        help="target backend type: rest | openai | function",
+        help="target backend type: rest | openai | bedrock | function",
     )
     tgt.add_argument(
         "--target-name", default=None, metavar="NAME",
@@ -139,6 +139,8 @@ examples:
             "target identifier - meaning depends on --target-type:  "
             "rest: base URL (http://my-api:8080),  "
             "openai: model name (gpt-4o),  "
+            "bedrock: model id or inference profile "
+            "(us.anthropic.claude-sonnet-4-20250514-v1:0),  "
             "function: module#fn (my_module#invoke)"
         ),
     )
@@ -148,7 +150,12 @@ examples:
     )
     tgt.add_argument(
         "--target-api-key", default=None, metavar="KEY",
-        help="Bearer token for the target (rest / openai types)",
+        help="Bearer token for the target (rest / openai types), "
+             "or a Bedrock API key (bedrock type; omit to use AWS credentials)",
+    )
+    tgt.add_argument(
+        "--target-region", default=None, metavar="REGION",
+        help="AWS region for a bedrock target (default: AWS_REGION / profile / us-east-1)",
     )
     tgt.add_argument(
         "--target-config", "-G", default=None, metavar="FILE",
@@ -490,13 +497,22 @@ def main(argv: list[str] | None = None) -> None:
             model=model,
             api_key=args.target_api_key,
         )
+    elif tt == "bedrock":
+        if not tn:
+            parser.error("--target-type bedrock requires --target-name <model id>")
+        from inference import BedrockProvider  # lazy: boto3 is an optional dep
+        target = BedrockProvider(
+            model=tn,
+            region=args.target_region,
+            api_key=args.target_api_key,
+        )
     elif cfg.targets:
         target = cfg.targets[0]   # single-target path — use first (and only) target
     elif args.generate_only:
         target = None             # generate-only never hits the target — none needed
     else:
         parser.error(
-            "no target configured — use --target-type rest|openai|function "
+            "no target configured — use --target-type rest|openai|bedrock|function "
             "or add a 'target: type:' / 'targets:' block to config.yaml"
         )
 

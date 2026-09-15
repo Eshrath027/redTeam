@@ -11,6 +11,8 @@ a = Analysis(
         *copy_metadata('anthropic'),
         *copy_metadata('mistralai'),
         *copy_metadata('openai'),
+        *copy_metadata('boto3'),
+        *copy_metadata('botocore'),
         # Built-in seed datasets — used when generation is off (the default).
         *[(f, 'datasets/builtin') for f in glob.glob('datasets/builtin/*.json')],
     ],
@@ -23,6 +25,8 @@ a = Analysis(
         'mistralai.client',
         'openai',
         'openai._client',
+        'boto3',
+        'botocore',
 
         # ── Async / HTTP (shared by all three SDKs) ───────────────────────────
         'httpx',

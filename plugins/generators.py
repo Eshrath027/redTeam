@@ -6,6 +6,7 @@ used:
 
   * `AnthropicGenerator`   — a hosted model via the Anthropic SDK.
   * `MistralGenerator`     — a hosted model via the Mistral SDK.
+  * `BedrockGenerator`     — any Amazon Bedrock model via boto3's Converse API.
   * `HuggingFaceGenerator` — a model loaded locally from the Hugging Face Hub.
   * `OpenAIGenerator`      — any OpenAI-compatible endpoint (OpenAI, vLLM, Ollama,
                              LM Studio, or any custom-deployed model).
@@ -199,6 +200,70 @@ class OpenAIGenerator(Generator):
             **self.params,
         )
         return (response.choices[0].message.content or "").strip()
+
+
+class BedrockGenerator(Generator):
+    """Generation via Amazon Bedrock's Converse API (any hosted model family).
+
+    `model` is a Bedrock model id, inference profile, or ARN. Credentials
+    resolve as in `inference.provider.bedrock_client`: `api_key` (a Bedrock API
+    key), explicit AWS keys, `profile`, then the default AWS chain.
+
+    Config example (config.yaml):
+        generation:
+          backend: bedrock
+          model: us.anthropic.claude-sonnet-4-20250514-v1:0
+          region: us-east-1
+    """
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        region: str | None = None,
+        api_key: str | None = None,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        aws_session_token: str | None = None,
+        profile: str | None = None,
+        endpoint_url: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float | None = 0.7,
+        system: str | None = None,
+        client: Any = None,
+        **params: Any,
+    ) -> None:
+        from inference.provider import bedrock_client
+
+        self.name = model
+        self.model = model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.system = system
+        self.params = params
+        self._client = client or bedrock_client(
+            region=region, api_key=api_key,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            profile=profile, endpoint_url=endpoint_url,
+        )
+
+    def complete(self, prompt: str) -> str:
+        from inference.provider import converse_text
+
+        inference: dict[str, Any] = {"maxTokens": self.max_tokens}
+        if self.temperature is not None:
+            inference["temperature"] = self.temperature
+        kwargs: dict[str, Any] = {
+            "modelId": self.model,
+            "messages": [{"role": "user", "content": [{"text": prompt}]}],
+            "inferenceConfig": inference,
+            **self.params,
+        }
+        if self.system is not None:
+            kwargs["system"] = [{"text": self.system}]
+        return converse_text(self._client.converse(**kwargs)).strip()
 
 
 class HuggingFaceGenerator(Generator):

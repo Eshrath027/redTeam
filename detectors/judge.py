@@ -12,6 +12,7 @@ backends default to low effort / low temperature / greedy decoding.
 Backends provided:
   * AnthropicJudge   — hosted, via Anthropic SDK
   * MistralJudge     — hosted, via Mistral SDK
+  * BedrockJudge     — hosted, any Amazon Bedrock model via boto3 Converse
   * HuggingFaceJudge — local, via transformers
   * LocalJudge       — any OpenAI-compatible /v1/chat/completions endpoint
                        (e.g. a self-hosted gated evaluator)
@@ -175,6 +176,121 @@ class MistralJudge(Judge):
         if response_format is not None:
             kwargs["response_format"] = response_format
         return self._client.chat.complete(**kwargs).choices[0].message.content
+
+
+class BedrockJudge(Judge):
+    """LLM-as-a-judge via Amazon Bedrock's Converse API (any hosted model family).
+
+    `model` is a Bedrock model id, inference profile, or ARN. Credentials
+    resolve as in `inference.provider.bedrock_client`: `api_key` (a Bedrock API
+    key), explicit AWS keys, `profile`, then the default AWS chain. Defaults to
+    `temperature=0` for deterministic grading; extra keyword args pass through
+    to `converse` (e.g. `additionalModelRequestFields`).
+
+    Config example::
+
+        grading:
+          backend: bedrock
+          model: us.anthropic.claude-sonnet-4-20250514-v1:0
+          region: us-east-1
+    """
+
+    supports_schema = True
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        region: str | None = None,
+        api_key: str | None = None,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        aws_session_token: str | None = None,
+        profile: str | None = None,
+        endpoint_url: str | None = None,
+        max_tokens: int = 1024,
+        temperature: float | None = 0.0,
+        system: str | None = None,
+        client: Any = None,
+        **params: Any,
+    ) -> None:
+        from inference.provider import bedrock_client
+
+        self.name = model
+        self.model = model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.system = system
+        self.params = params
+        self._client = client or bedrock_client(
+            region=region, api_key=api_key,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            profile=profile, endpoint_url=endpoint_url,
+        )
+        # Flipped off permanently on the first rejection — see LocalJudge.
+        self._schema_supported = True
+
+    def evaluate(self, prompt: str, *, response_format: dict | None = None) -> str:
+        output_config = _converse_output_config(response_format) if self._schema_supported else None
+        if output_config is None:
+            return self._converse(prompt, None)
+        try:
+            return self._converse(prompt, output_config)
+        except Exception as exc:  # noqa: BLE001 — narrowed below
+            # Only a rejected *request* means "no structured output for this
+            # model". Throttling or an outage must not disable it for the run.
+            from botocore.exceptions import ClientError, ParamValidationError
+
+            rejected = isinstance(exc, ParamValidationError) or (
+                isinstance(exc, ClientError)
+                and exc.response.get("Error", {}).get("Code") == "ValidationException"
+            )
+            if not rejected:
+                raise
+            self._schema_supported = False
+            return self._converse(prompt, None)
+
+    def _converse(self, prompt: str, output_config: dict | None) -> str:
+        from inference.provider import converse_text
+
+        inference: dict[str, Any] = {"maxTokens": self.max_tokens}
+        if self.temperature is not None:
+            inference["temperature"] = self.temperature
+        kwargs: dict[str, Any] = {
+            "modelId": self.model,
+            "messages": [{"role": "user", "content": [{"text": prompt}]}],
+            "inferenceConfig": inference,
+            **self.params,
+        }
+        if self.system is not None:
+            kwargs["system"] = [{"text": self.system}]
+        if output_config is not None:
+            kwargs["outputConfig"] = output_config
+        return converse_text(self._client.converse(**kwargs)).strip()
+
+
+def _converse_output_config(response_format: dict | None) -> dict | None:
+    """Translate an OpenAI-style `json_schema` response_format into Converse's
+    `outputConfig`. Anything else (none, `json_object`) has no Converse
+    equivalent and is sent unconstrained."""
+    import json as _json
+
+    if not response_format or response_format.get("type") != "json_schema":
+        return None
+    spec = response_format.get("json_schema") or {}
+    return {
+        "textFormat": {
+            "type": "json_schema",
+            "structure": {
+                "jsonSchema": {
+                    "name": spec.get("name", "response"),
+                    "schema": _json.dumps(spec.get("schema", {})),
+                }
+            },
+        }
+    }
 
 
 class LocalJudge(Judge):
