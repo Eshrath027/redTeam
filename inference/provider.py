@@ -790,7 +790,7 @@ class MistralProvider(Provider):
 
     def __init__(
         self,
-        model: str = "mistral-large-latest",
+        model: str = "mistral-large-2512",
         *,
         api_key: str | None = None,
         max_tokens: int = 4096,

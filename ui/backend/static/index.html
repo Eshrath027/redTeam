@@ -2001,7 +2001,7 @@ function onGenBackendChange() {
   document.getElementById('gen-url-field').style.display = v === 'custom' ? '' : 'none';
   document.getElementById('gen-region-field').style.display = v === 'bedrock' ? '' : 'none';
   document.getElementById('gen-key').placeholder = v === 'bedrock' ? 'Bedrock API key (blank = AWS credentials)' : 'sk-…';
-  const models = {anthropic:'claude-opus-4-8',mistral:'mistral-large-latest',openai:'gpt-4o',bedrock:'us.anthropic.claude-sonnet-4-20250514-v1:0',custom:''};
+  const models = {anthropic:'claude-opus-4-8',mistral:'mistral-large-2512',openai:'gpt-4o',bedrock:'us.anthropic.claude-sonnet-4-20250514-v1:0',custom:''};
   document.getElementById('gen-model').placeholder = models[v] || '';
 }
 
@@ -2010,7 +2010,7 @@ function onGradeBackendChange() {
   document.getElementById('grade-url-field').style.display = (v === 'custom' || v === 'local') ? '' : 'none';
   document.getElementById('grade-region-field').style.display = v === 'bedrock' ? '' : 'none';
   document.getElementById('grade-key').placeholder = v === 'bedrock' ? 'Bedrock API key (blank = AWS credentials)' : 'sk-…';
-  const models = {anthropic:'claude-opus-4-8',mistral:'mistral-large-latest',openai:'gpt-4o-mini',bedrock:'us.anthropic.claude-sonnet-4-20250514-v1:0',custom:'your-model',local:'red-team-evaluator'};
+  const models = {anthropic:'claude-opus-4-8',mistral:'mistral-large-2512',openai:'gpt-4o-mini',bedrock:'us.anthropic.claude-sonnet-4-20250514-v1:0',custom:'your-model',local:'red-team-evaluator'};
   document.getElementById('grade-model').placeholder = models[v] || '';
 }
 
@@ -2030,7 +2030,7 @@ function syncTargetTypeUI() {
   const ph = {
     openai: "gpt-4o",
     anthropic: "claude-opus-4-8",
-    mistral: "mistral-large-latest",
+    mistral: "mistral-large-2512",
     bedrock: "us.anthropic.claude-sonnet-4-20250514-v1:0",
     rest: "http://my-api:8080",
     function: "my_module#invoke"
