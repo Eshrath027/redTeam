@@ -75,14 +75,14 @@ class AnthropicGenerator(Generator):
 class MistralGenerator(Generator):
     """Generation via the Mistral SDK.
 
-    Defaults to `mistral-large-latest`. Extra keyword args pass straight through
+    Defaults to `mistral-large-2512`. Extra keyword args pass straight through
     to `chat.complete` (e.g. `top_p`, `random_seed`) so the backend can be
     expanded without changing this surface.
     """
 
     def __init__(
         self,
-        model: str = "mistral-large-latest",
+        model: str = "mistral-large-2512",
         *,
         max_tokens: int = 4096,
         temperature: float = 0.7,

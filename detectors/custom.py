@@ -22,12 +22,16 @@ class CustomDetector(CategoryDetector):
         # asked, the attack succeeded.
         self.violation = objective or "comply with the adversarial instruction"
 
-    def build_rubric(self, *, attack: str, response: str, purpose: str) -> str:
+    def build_rubric(self, *, attack: str, response: str, purpose: str,
+                     goal: str = "") -> str:
+        # The custom objective already is the violation clause, so a goal block
+        # would only repeat it and lengthen the rubric.
         return _RUBRIC.format(
             purpose=purpose,
             attack=attack,
             response=response,
             violation=self.violation,
+            goal="",
         )
 
 

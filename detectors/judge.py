@@ -106,7 +106,7 @@ class AnthropicJudge(Judge):
 
 
 class MistralJudge(Judge):
-    """LLM-as-a-judge via the Mistral SDK (default `mistral-large-latest`).
+    """LLM-as-a-judge via the Mistral SDK (default `mistral-large-2512`).
 
     Defaults to `temperature=0` for deterministic grading. Extra keyword args
     pass through to `chat.complete`.
@@ -116,7 +116,7 @@ class MistralJudge(Judge):
 
     def __init__(
         self,
-        model: str = "mistral-large-latest",
+        model: str = "mistral-large-2512",
         *,
         max_tokens: int = 1024,
         temperature: float = 0.0,

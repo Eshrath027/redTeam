@@ -52,6 +52,9 @@ class Finding:
     score: float             # evaluator confidence
     reason: str              # evaluator one-line rationale
     timestamp: str
+    #: Evidence behind the verdict (quote, delivered, grounded, on_topic), or
+    #: None when the verdict carried none to check.
+    axes: dict[str, Any] | None = None
 
     @property
     def graded(self) -> bool:
@@ -109,6 +112,7 @@ class FindingsReport:
             score=result.score,
             reason=result.reason,
             timestamp=_now(),
+            axes=getattr(result, "axes", None),
         )
         self._findings.append(finding)
         return finding
@@ -143,6 +147,7 @@ class FindingsReport:
                     "passed": f.passed,
                     "score": f.score,
                     "reason": f.reason,
+                    "axes": f.axes,
                     "timestamp": f.timestamp,
                 }
             )

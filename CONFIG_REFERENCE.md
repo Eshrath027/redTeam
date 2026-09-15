@@ -45,7 +45,7 @@ generation:
 | Parameter | Type | Required | Default | Description | Example |
 |---|---|---|---|---|---|
 | `backend` | string | **required** | `anthropic` | Generation backend. | `anthropic` \| `openai` \| `mistral` \| `bedrock` \| `huggingface` \| `custom` |
-| `model` | string | **required** | — | Model id for the chosen backend. | `claude-opus-4-8`, `gpt-4o`, `mistral-large-latest`, `meta-llama/Llama-3.1-8B-Instruct` |
+| `model` | string | **required** | — | Model id for the chosen backend. | `claude-opus-4-8`, `gpt-4o`, `mistral-large-2512`, `meta-llama/Llama-3.1-8B-Instruct` |
 | `api_key` | string | no | — | API key / bearer token. | `sk-ant-...`, `sk-proj-...` |
 | `base_url` | string | no | — | **`custom` only.** Base URL for OpenAI-compatible endpoint (vLLM, Ollama, LM Studio). | `http://localhost:8000/v1` |
 | `temperature` | float | no | `0.7` | Sampling temperature. Higher = more varied attacks. | `0.9` |

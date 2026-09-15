@@ -31,7 +31,7 @@ from config import load_config
 from detectors import all_detector_ids, get_detector
 from inference import CallableProvider, RestProvider
 from plugins import (
-    CATEGORIES, DatasetPlugin, PLUGIN_SEVERITY, _REGISTRY, all_plugin_ids,
+    CATEGORIES, DatasetPlugin, PLUGIN_SEVERITY, _REGISTRY, all_plugin_ids, objective_for,
     builtin_dataset_path, category_for_plugin, get_plugin, has_builtin_dataset,
     resolve_plugin_ids,
 )
@@ -821,7 +821,7 @@ def main(argv: list[str] | None = None) -> None:
                         "response": None, "passed": None, "score": None,
                         "reason": None, "error": err,
                         "purpose": cfg.purpose,
-                        "generation_model": cfg.generation.name,
+                        "generation_model": cfg.generation.name if cfg.generation else None,
                         "grading_model": cfg.grading.name,
                     },
                 }
@@ -847,6 +847,10 @@ def main(argv: list[str] | None = None) -> None:
 
             interactive = interactive_strategies.get(case.metadata.get("strategy") or "")
             turns, transcript, backtracks, reconfirmed = 1, None, None, None
+            # The attack's goal, given to the judge on every grading call so a
+            # drifting turn or a strategy wrapper is judged against what the
+            # attack is actually for, not just the literal final message.
+            objective = objective_for(case.plugin_id, case.detector_id, case.metadata)
 
             if interactive is not None:
                 # Multi-turn: the strategy owns the loop, grading each turn to
@@ -859,10 +863,11 @@ def main(argv: list[str] | None = None) -> None:
                         seed_prompt=case.prompt,
                         target=tgt,
                         grade=lambda a, r: detector.grade(
-                            attack=a, response=r, purpose=cfg.purpose),
+                            attack=a, response=r, purpose=cfg.purpose,
+                            objective=objective),
                         generator=cfg.generation,
                         purpose=cfg.purpose,
-                        objective=case.metadata.get("objective") or "",
+                        objective=objective,
                         # Already resolved (per-plugin over global) when the
                         # plugin built the case, so refined turns inherit the
                         # same contract the seed prompt was generated under.
@@ -897,15 +902,12 @@ def main(argv: list[str] | None = None) -> None:
                 result = await loop.run_in_executor(
                     None,
                     lambda: detector.grade(
-                        attack=case.prompt, response=response, purpose=cfg.purpose),
+                        attack=case.prompt, response=response, purpose=cfg.purpose,
+                        objective=objective),
                 )
                 t_grade = time.perf_counter() - t1
 
             cat_key, cat_label = category_for_plugin(case.plugin_id, case.detector_id)
-            objective = case.metadata.get("objective") or None
-            if not objective:
-                cls = _REGISTRY.get(case.plugin_id) or _REGISTRY.get(case.detector_id)
-                objective = getattr(cls, "objective", None) or None
 
             record = {
                 "run_id": run_id,
@@ -915,7 +917,7 @@ def main(argv: list[str] | None = None) -> None:
                 "detector_id": case.detector_id,
                 "category": cat_key,
                 "category_label": cat_label,
-                "objective": objective,
+                "objective": objective or None,
                 "frameworks": case.frameworks or None,
                 "controls": case.controls or None,
                 # `severity` is always our built-in default for the attack type;
@@ -937,8 +939,13 @@ def main(argv: list[str] | None = None) -> None:
                 "passed": result.passed,
                 "score": result.score,
                 "reason": result.reason,
+                # The evidence the verdict was derived from: the judge's quote,
+                # whether code found it in the response, and the delivered level.
+                # None when no quote check ran (empty response, legacy-format
+                # reply), which is itself the signal to distrust a finding.
+                "axes": getattr(result, "axes", None),
                 "purpose": cfg.purpose,
-                "generation_model": cfg.generation.name,
+                "generation_model": cfg.generation.name if cfg.generation else None,
                 "grading_model": cfg.grading.name,
                 "language": case.metadata.get("language"),
                 "language_code": case.metadata.get("language_code"),

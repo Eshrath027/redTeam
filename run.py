@@ -21,6 +21,7 @@ from pathlib import Path
 from config import load_config
 from detectors import all_detector_ids, get_detector
 from findings import FindingsReport
+from plugins import objective_for
 from strategies import apply_strategies
 
 #: Detector ids with a dedicated grader, resolved once at import.
@@ -135,7 +136,8 @@ def main(config_path: str | None = None, output_path: str | None = None) -> None
                 response = target.generate(case.prompt)
                 detector = _detector_for(case, cfg.grading)
                 result = detector.grade(
-                    attack=case.prompt, response=response, purpose=cfg.purpose
+                    attack=case.prompt, response=response, purpose=cfg.purpose,
+                    objective=objective_for(case.plugin_id, case.detector_id, case.metadata),
                 )
 
                 # passed is None when the judge gave no readable verdict: neither
@@ -164,8 +166,9 @@ def main(config_path: str | None = None, output_path: str | None = None) -> None
                     "passed":           result.passed,
                     "score":            result.score,
                     "reason":           result.reason,
+                    "axes":             getattr(result, "axes", None),
                     "purpose":          cfg.purpose,
-                    "generation_model": cfg.generation.name,
+                    "generation_model": cfg.generation.name if cfg.generation else None,
                     "grading_model":    cfg.grading.name,
                 }
                 f.write(json.dumps(record) + "\n")
