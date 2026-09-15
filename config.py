@@ -23,6 +23,7 @@ import yaml
 
 from plugins import (
     AnthropicGenerator,
+    BedrockGenerator,
     DatasetPlugin,
     Generator,
     HuggingFaceGenerator,
@@ -38,6 +39,7 @@ from plugins import (
 from strategies import Strategy, get_strategy
 from detectors import (
     AnthropicJudge,
+    BedrockJudge,
     HuggingFaceJudge,
     Judge,
     LocalJudge,
@@ -45,6 +47,7 @@ from detectors import (
 )
 from inference import (
     AnthropicProvider,
+    BedrockProvider,
     CallableProvider,
     MistralProvider,
     Provider,
@@ -86,12 +89,14 @@ def build_generator(spec: dict[str, Any]) -> Generator:
         return AnthropicGenerator(model, **spec)
     if backend == "mistral":
         return MistralGenerator(model, **spec)
+    if backend == "bedrock":
+        return BedrockGenerator(model, **spec)
     if backend == "huggingface":
         return HuggingFaceGenerator(model, **spec)
     if backend in ("openai", "custom"):
         return OpenAIGenerator(model, **spec)
     raise ValueError(
-        f"unknown generator backend {backend!r} (expected anthropic | mistral | huggingface | openai | custom)"
+        f"unknown generator backend {backend!r} (expected anthropic | mistral | bedrock | huggingface | openai | custom)"
     )
 
 
@@ -103,6 +108,7 @@ def build_target(spec: dict[str, Any]) -> Provider:
     ``type: rest``       Generic REST endpoint with custom request/response templates.
     ``type: anthropic``  Anthropic API (Claude models).
     ``type: mistral``    Mistral API (Mistral models).
+    ``type: bedrock``    Amazon Bedrock (name = model id / inference profile; ``region``).
     ``type: function``   Python callable (name = module#fn).
     """
     spec = dict(spec)
@@ -150,13 +156,19 @@ def build_target(spec: dict[str, Any]) -> Provider:
     if target_type == "mistral":
         model = spec.pop("name", spec.pop("model", "mistral-large-latest"))
         return MistralProvider(model=model, **spec)
+    if target_type == "bedrock":
+        name, model_key = spec.pop("name", None), spec.pop("model", None)
+        model = name or model_key
+        if not model:
+            raise ValueError("target type 'bedrock' requires 'name' (Bedrock model id or inference profile)")
+        return BedrockProvider(model=model, **spec)
     if target_type == "function":
         fn_spec = spec.pop("name", None)
         if not fn_spec:
             raise ValueError("target type 'function' requires 'name' (module#fn)")
         return CallableProvider.from_module_spec(fn_spec)
     raise ValueError(
-        f"unknown target type {target_type!r} (expected rest | openai | custom | anthropic | mistral | function)"
+        f"unknown target type {target_type!r} (expected rest | openai | custom | anthropic | mistral | bedrock | function)"
     )
 
 
@@ -173,6 +185,8 @@ def build_judge(spec: dict[str, Any]) -> Judge:
         return AnthropicJudge(model, **spec)
     if backend == "mistral":
         return MistralJudge(model, **spec)
+    if backend == "bedrock":
+        return BedrockJudge(model, **spec)
     if backend == "huggingface":
         return HuggingFaceJudge(model, **spec)
     if backend == "local" or backend == "custom":
@@ -181,7 +195,7 @@ def build_judge(spec: dict[str, Any]) -> Judge:
             raise ValueError(f"{backend} judge requires a 'url' or 'base_url' key")
         return LocalJudge(base_url=url, model=model, **spec)
     raise ValueError(
-        f"unknown judge backend {backend!r} (expected anthropic | mistral | huggingface | local | custom)"
+        f"unknown judge backend {backend!r} (expected anthropic | mistral | bedrock | huggingface | local | custom)"
     )
 
 

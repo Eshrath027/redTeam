@@ -33,8 +33,9 @@ Issues     = "https://github.com/accuknox/redTeam/issues"
 anthropic    = ["anthropic>=0.109.2"]
 mistral      = ["mistralai>=1.0.0"]
 openai       = ["openai>=1.0.0"]
+bedrock      = ["boto3>=1.35.0"]
 huggingface  = ["transformers>=4.40.0", "torch>=2.2.0"]
-all          = ["anthropic>=0.109.2", "mistralai>=1.0.0", "openai>=1.0.0"]
+all          = ["anthropic>=0.109.2", "mistralai>=1.0.0", "openai>=1.0.0", "boto3>=1.35.0"]
 ui           = [
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.29.0",
@@ -42,7 +43,7 @@ ui           = [
     "python-multipart>=0.0.9",
     "sse-starlette>=2.0.0",
 ]
-build        = ["anthropic>=0.109.2", "mistralai>=1.0.0", "openai>=1.0.0", "pyinstaller>=6.0.0"]
+build        = ["anthropic>=0.109.2", "mistralai>=1.0.0", "openai>=1.0.0", "boto3>=1.35.0", "pyinstaller>=6.0.0"]
 
 [project.scripts]
 knox-rt    = "cli:main"

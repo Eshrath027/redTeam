@@ -6,6 +6,7 @@ lives in the `plugins` layer, and grading lives in `detectors`.
 
 from inference.provider import (
     AnthropicProvider,
+    BedrockProvider,
     CallableProvider,
     Message,
     MistralProvider,
@@ -18,6 +19,7 @@ __all__ = [
     "Provider",
     "RestProvider",
     "AnthropicProvider",
+    "BedrockProvider",
     "MistralProvider",
     "CallableProvider",
     "ScriptedProvider",

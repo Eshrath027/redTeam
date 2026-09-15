@@ -621,6 +621,147 @@ class AnthropicProvider(Provider):
         return with_tool_calls(text, response)
 
 
+def bedrock_client(
+    *,
+    region: str | None = None,
+    api_key: str | None = None,
+    aws_access_key_id: str | None = None,
+    aws_secret_access_key: str | None = None,
+    aws_session_token: str | None = None,
+    profile: str | None = None,
+    endpoint_url: str | None = None,
+    timeout: int = 120,
+) -> Any:
+    """Build a `bedrock-runtime` client. Shared by the target and the generator.
+
+    Credentials resolve in this order:
+
+      * `api_key` — a Bedrock API key, sent as a bearer token. Requests are
+        left unsigned so SigV4 does not overwrite the header.
+      * explicit `aws_access_key_id` / `aws_secret_access_key` (+ session token).
+      * `profile`, then boto3's default chain (env vars, ~/.aws, IAM role).
+
+    Nothing is written to the process environment, so a generator and a target
+    in the same run can use different accounts.
+    """
+    import os
+
+    import boto3
+    from botocore import UNSIGNED
+    from botocore.config import Config
+
+    session = boto3.Session(
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        aws_session_token=aws_session_token,
+        profile_name=profile,
+    )
+    region = (region or session.region_name or os.environ.get("AWS_REGION")
+              or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1")
+    # Provider.generate() retries with backoff already; keep botocore's own
+    # retries light so the two don't multiply.
+    cfg = Config(
+        read_timeout=timeout,
+        retries={"max_attempts": 2, "mode": "standard"},
+        max_pool_connections=64,
+        **({"signature_version": UNSIGNED} if api_key else {}),
+    )
+    client = session.client("bedrock-runtime", region_name=region,
+                            endpoint_url=endpoint_url, config=cfg)
+    if api_key:
+        def _add_bearer(request, **_: Any) -> None:
+            request.headers["Authorization"] = f"Bearer {api_key}"
+        client.meta.events.register("before-send.bedrock-runtime.*", _add_bearer)
+    return client
+
+
+def to_converse_messages(messages: list[Message]) -> tuple[list[dict], list[dict]]:
+    """Map neutral messages onto the Bedrock Converse shape.
+
+    Returns `(system_blocks, messages)`. Converse rejects two consecutive turns
+    with the same role, which a multi-turn strategy can produce, so adjacent
+    same-role turns are merged rather than sent as-is.
+    """
+    system = [{"text": m["content"]} for m in messages
+              if m["role"] == "system" and m["content"]]
+    out: list[dict] = []
+    for m in messages:
+        if m["role"] == "system":
+            continue
+        role = "assistant" if m["role"] == "assistant" else "user"
+        block = {"text": m["content"] or " "}  # empty text blocks are rejected
+        if out and out[-1]["role"] == role:
+            out[-1]["content"].append(block)
+        else:
+            out.append({"role": role, "content": [block]})
+    return system, out
+
+
+def converse_text(response: dict) -> str:
+    """Join the text blocks of a Converse response."""
+    blocks = response.get("output", {}).get("message", {}).get("content", [])
+    return "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+
+
+class BedrockProvider(Provider):
+    """Target backed by Amazon Bedrock (any model family) via the Converse API.
+
+    `model` is a Bedrock model id (`anthropic.claude-3-5-sonnet-20240620-v1:0`),
+    a cross-region inference profile (`us.anthropic.claude-sonnet-4-...`), or a
+    provisioned-throughput / custom-model ARN. Converse gives every family one
+    request shape, so no per-vendor body templates are needed. See
+    `bedrock_client()` for how credentials resolve.
+    """
+
+    name = "bedrock"
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        region: str | None = None,
+        api_key: str | None = None,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        aws_session_token: str | None = None,
+        profile: str | None = None,
+        endpoint_url: str | None = None,
+        system: str | None = None,
+        max_tokens: int = 2048,
+        temperature: float | None = 0.0,
+        timeout: int = 120,
+        client: Any = None,
+        **params: Any,
+    ) -> None:
+        super().__init__(model=model, system=system, max_tokens=max_tokens, params=params)
+        self.temperature = temperature
+        self._client = client or bedrock_client(
+            region=region, api_key=api_key,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            profile=profile, endpoint_url=endpoint_url, timeout=timeout,
+        )
+
+    def _complete(self, messages: list[Message]) -> str:
+        system, turns = to_converse_messages(messages)
+        inference = {"maxTokens": self.max_tokens}
+        if self.temperature is not None:
+            inference["temperature"] = self.temperature
+        kwargs: dict[str, Any] = {
+            "modelId": self.model,
+            "messages": turns,
+            "inferenceConfig": inference,
+            **self.params,  # e.g. additionalModelRequestFields, guardrailConfig
+        }
+        if system:
+            kwargs["system"] = system
+        response = self._client.converse(**kwargs)
+        # Converse returns tool invocations as `toolUse` blocks, which
+        # with_tool_calls() already recognises.
+        return with_tool_calls(converse_text(response), response.get("output", {}))
+
+
 class MistralProvider(Provider):
     """Target backed by the Mistral API.
 

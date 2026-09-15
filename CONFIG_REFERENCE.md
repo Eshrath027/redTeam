@@ -44,12 +44,14 @@ generation:
 
 | Parameter | Type | Required | Default | Description | Example |
 |---|---|---|---|---|---|
-| `backend` | string | **required** | `anthropic` | Generation backend. | `anthropic` \| `openai` \| `mistral` \| `huggingface` \| `custom` |
+| `backend` | string | **required** | `anthropic` | Generation backend. | `anthropic` \| `openai` \| `mistral` \| `bedrock` \| `huggingface` \| `custom` |
 | `model` | string | **required** | — | Model id for the chosen backend. | `claude-opus-4-8`, `gpt-4o`, `mistral-large-latest`, `meta-llama/Llama-3.1-8B-Instruct` |
 | `api_key` | string | no | — | API key / bearer token. | `sk-ant-...`, `sk-proj-...` |
 | `base_url` | string | no | — | **`custom` only.** Base URL for OpenAI-compatible endpoint (vLLM, Ollama, LM Studio). | `http://localhost:8000/v1` |
 | `temperature` | float | no | `0.7` | Sampling temperature. Higher = more varied attacks. | `0.9` |
 | `effort` | string | no | — | **Anthropic only.** Thinking depth. | `low` \| `medium` \| `high` |
+| `region` | string | no | `AWS_REGION` or `us-east-1` | **`bedrock` only.** AWS region. | `us-west-2` |
+| `profile` / `aws_access_key_id` / `aws_secret_access_key` / `aws_session_token` | string | no | default AWS chain | **`bedrock` only.** AWS credentials. `api_key` is used as a Bedrock API key. | `default` |
 | `url` | string | no | — | **`huggingface` only.** Custom inference endpoint. | `http://localhost:8000` |
 | `max_new_tokens` | int | no | `512` | **`huggingface` only.** Max tokens to generate. | `1024` |
 
@@ -68,12 +70,13 @@ grading:
 
 | Parameter | Type | Required | Default | Description | Example |
 |---|---|---|---|---|---|
-| `backend` | string | **required** | `anthropic` | Judge backend. | `anthropic` \| `openai` \| `mistral` \| `huggingface` \| `custom` \| `local` |
+| `backend` | string | **required** | `anthropic` | Judge backend. | `anthropic` \| `openai` \| `mistral` \| `bedrock` \| `huggingface` \| `custom` \| `local` |
 | `model` | string | **required** | — | Model id. | `claude-opus-4-8`, `gpt-4o-mini`, `mistral-small-latest` |
 | `api_key` | string | no | — | API key. | `sk-ant-...`, `sk-proj-...` |
 | `base_url` | string | no | — | **`custom` or `local` only.** OpenAI-compatible judge endpoint. | `http://localhost:8000/v1`, `http://my-evaluator:47923` |
 | `temperature` | float | no | `0.0` | Keep at `0` for deterministic grading. | `0.0` |
 | `effort` | string | no | — | **Anthropic only.** | `low` \| `medium` \| `high` |
+| `region`, `profile`, AWS keys | string | no | default AWS chain | **`bedrock` only.** Same as `generation`. Uses JSON-schema structured output where the model supports it. | `us-east-1` |
 
 **`custom` backend** — for a self-hosted OpenAI-compatible evaluator (vLLM, Ollama, LM Studio):
 
@@ -180,6 +183,32 @@ target:
 | `config` | string | no | Path to a REST config file. Takes precedence over `name`. Use this for non-OpenAI APIs. | `my_api.yaml` |
 | `name` | string | no | Full endpoint URL when not using a config file. | `http://my-api:8080/generate` |
 | `api_key` | string | no | Replaces `$KEY` in the config file's `headers` block. | `my-secret` |
+
+---
+
+### `type: bedrock` — Amazon Bedrock
+
+Any Bedrock model family (Claude, Llama, Mistral, Nova, …) through the Converse API. Requires `pip install boto3` (or `.[bedrock]`).
+
+```yaml
+target:
+  type: bedrock
+  name: us.anthropic.claude-sonnet-4-20250514-v1:0   # model id, inference profile, or ARN
+  region: us-east-1
+  # api_key: ABSK...        # Bedrock API key; omit to use AWS credentials
+  # profile: my-profile     # or aws_access_key_id / aws_secret_access_key / aws_session_token
+```
+
+| Parameter | Type | Required | Description | Example |
+|---|---|---|---|---|
+| `type` | string | **required** | Target type. | `bedrock` |
+| `name` | string | **required** | Bedrock model id, inference profile id, or ARN. | `meta.llama3-70b-instruct-v1:0` |
+| `region` | string | no | AWS region (defaults to `AWS_REGION` / profile / `us-east-1`). | `us-west-2` |
+| `api_key` | string | no | Bedrock API key (sent as a bearer token). | `ABSK...` |
+| `profile`, `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token` | string | no | Explicit AWS credentials; otherwise the default AWS chain (env, `~/.aws`, IAM role). | — |
+| `endpoint_url` | string | no | VPC / PrivateLink endpoint. | `https://vpce-...bedrock-runtime...` |
+| `max_tokens`, `temperature` | int / float | no | Inference config. Defaults `2048` / `0.0`. | — |
+| `guardrailConfig`, `additionalModelRequestFields` | object | no | Passed straight to `converse`. | `{guardrailIdentifier: abc, guardrailVersion: "1"}` |
 
 ---
 
