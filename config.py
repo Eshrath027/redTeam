@@ -154,7 +154,7 @@ def build_target(spec: dict[str, Any]) -> Provider:
         model = spec.pop("name", spec.pop("model", "claude-opus-4-8"))
         return AnthropicProvider(model=model, **spec)
     if target_type == "mistral":
-        model = spec.pop("name", spec.pop("model", "mistral-large-latest"))
+        model = spec.pop("name", spec.pop("model", "mistral-large-2512"))
         return MistralProvider(model=model, **spec)
     if target_type == "bedrock":
         name, model_key = spec.pop("name", None), spec.pop("model", None)
