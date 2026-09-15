@@ -202,6 +202,10 @@ button{cursor:pointer}
 .strat-badge-sm{display:inline-block;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:600;background:var(--surface2);color:var(--text-secondary)}
 .obj-txt{font-size:10px;color:var(--text-muted);line-height:1.35;margin-top:4px}
 .reason-row td{padding:0 10px 8px 10px;font-size:11px;line-height:1.45;color:var(--text-secondary)}
+.evidence{margin-top:4px}
+.evidence q{font-family:var(--mono);quotes:none;color:var(--text-primary,inherit);background:var(--surface2);padding:1px 4px;border-radius:3px;white-space:pre-wrap;word-break:break-word}
+.ev-tag{display:inline-block;font-size:9px;font-weight:600;padding:0 5px;border-radius:3px;margin-left:4px;background:var(--surface2);color:var(--text-muted)}
+.ev-warn{color:#FBBF24}
 .reason-lbl{display:inline-block;font-size:9px;font-weight:700;letter-spacing:0.4px;padding:1px 6px;border-radius:4px;margin-right:6px;vertical-align:middle}
 .why-vuln .reason-lbl{background:var(--accent-dim);color:#FCA5A5}
 .why-safe .reason-lbl{background:var(--green-dim);color:#86EFAC}
@@ -1917,7 +1921,7 @@ function renderResults(data) {
             const whyCls = ungraded ? 'why-err' : (r.passed ? 'why-safe' : 'why-vuln');
             const whyLbl = ungraded ? 'NOT GRADED' : (r.passed ? 'RESISTED' : 'VULNERABLE');
             const why = r.reason ? `<tr class="reason-row ${whyCls}"><td colspan="4">
-              <span class="reason-lbl">WHY ${whyLbl}</span> ${esc(r.reason)}</td></tr>` : '';
+              <span class="reason-lbl">WHY ${whyLbl}</span> ${esc(r.reason)}${ungraded ? '' : evidenceHTML(r.axes, r.passed)}</td></tr>` : '';
             // Multi-turn cases get the full turn-by-turn expander. A single-turn
             // case is already fully shown in the main row (that one turn), so it
             // needs only the "broke on turn 1" tag above — no redundant expander.
@@ -1928,6 +1932,7 @@ function renderResults(data) {
                   <div class="turn-h">Turn ${t.turn} — ${t.passed === null ? 'not graded' : (t.passed ? 'resisted' : 'COMPLIED')}${t.reconfirmed === false ? ' (break discounted on replay)' : ''}</div>
                   <div class="turn-a"><span class="turn-lbl">ATTACK</span>${esc(t.attack || '')}</div>
                   <div class="turn-r"><span class="turn-lbl">REPLY</span>${esc(t.response || '')}</div>
+                  ${t.passed === false ? evidenceHTML(t.axes, t.passed) : ''}
                 </div>`).join('')}
               </details></td></tr>`;
             return main + why + detail;
@@ -1972,6 +1977,23 @@ function switchTab(name, btn) {
   if (btn) btn.classList.add('active');
   document.getElementById(`tab-${name}`).classList.add('active');
   if (name === 'config') updateConfig();
+}
+
+// The judge's evidence for a verdict: the quote it pointed at, how much it says
+// was delivered, and whether code found that quote in the response. A break
+// with no evidence means no quote check ran, so it is flagged rather than hidden.
+function evidenceHTML(axes, passed) {
+  if (!axes) {
+    return passed === false
+      ? `<div class="evidence ev-warn">⚠ No quote was checked for this verdict — verify the response manually.</div>`
+      : '';
+  }
+  if (!axes.quote) return '';
+  const found = axes.grounded
+    ? '<span class="ev-tag">✓ found in response</span>'
+    : '<span class="ev-tag ev-warn">✗ not in response</span>';
+  return `<div class="evidence">Evidence: <q>${esc(axes.quote)}</q>
+    <span class="ev-tag">delivered: ${esc(axes.delivered || '?')}</span>${found}</div>`;
 }
 
 function onGenBackendChange() {

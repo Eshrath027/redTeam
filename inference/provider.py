@@ -638,8 +638,10 @@ def bedrock_client(
 
       * `api_key` — a Bedrock API key, sent as a bearer token. Requests are
         left unsigned so SigV4 does not overwrite the header.
-      * explicit `aws_access_key_id` / `aws_secret_access_key` (+ session token).
-      * `profile`, then boto3's default chain (env vars, ~/.aws, IAM role).
+      * explicit `aws_access_key_id` / `aws_secret_access_key` (+ session token),
+        or `profile`.
+      * `AWS_BEARER_TOKEN_BEDROCK` (read by botocore itself).
+      * boto3's default chain (env vars, ~/.aws, IAM role).
 
     Nothing is written to the process environment, so a generator and a target
     in the same run can use different accounts.
@@ -660,11 +662,20 @@ def bedrock_client(
               or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1")
     # Provider.generate() retries with backoff already; keep botocore's own
     # retries light so the two don't multiply.
+    # botocore picks bearer auth on its own whenever AWS_BEARER_TOKEN_BEDROCK is
+    # set, even over keys passed here. Pin SigV4 when the caller named keys or a
+    # profile, so an ambient token cannot silently override explicit config.
+    if api_key:
+        signing = {"signature_version": UNSIGNED}
+    elif aws_access_key_id or profile:
+        signing = {"signature_version": "v4"}
+    else:
+        signing = {}
     cfg = Config(
         read_timeout=timeout,
         retries={"max_attempts": 2, "mode": "standard"},
         max_pool_connections=64,
-        **({"signature_version": UNSIGNED} if api_key else {}),
+        **signing,
     )
     client = session.client("bedrock-runtime", region_name=region,
                             endpoint_url=endpoint_url, config=cfg)
@@ -689,11 +700,17 @@ def to_converse_messages(messages: list[Message]) -> tuple[list[dict], list[dict
         if m["role"] == "system":
             continue
         role = "assistant" if m["role"] == "assistant" else "user"
-        block = {"text": m["content"] or " "}  # empty text blocks are rejected
+        # Empty *and* whitespace-only text blocks are rejected by several model
+        # families, so a placeholder needs a visible character.
+        block = {"text": m["content"] if (m["content"] or "").strip() else "."}
         if out and out[-1]["role"] == role:
             out[-1]["content"].append(block)
         else:
             out.append({"role": role, "content": [block]})
+    # Converse needs at least one turn, and most families (Llama, Mistral, Nova)
+    # reject a conversation that opens with an assistant turn.
+    if not out or out[0]["role"] != "user":
+        out.insert(0, {"role": "user", "content": [{"text": "."}]})
     return system, out
 
 

@@ -512,7 +512,22 @@ def category_for_plugin(plugin_id: str, detector_id: str = "") -> tuple[str, str
     return key, CATEGORY_LABELS[key]
 
 
+def objective_for(plugin_id: str, detector_id: str = "",
+                  metadata: dict | None = None) -> str:
+    """The attack's goal: the case's own objective, else its plugin's.
+
+    One lookup shared by the runners and calibration, so the judge is given the
+    same goal wherever a case is graded.
+    """
+    objective = (metadata or {}).get("objective") or ""
+    if not objective:
+        cls = _REGISTRY.get(plugin_id) or _REGISTRY.get(detector_id)
+        objective = getattr(cls, "objective", "") or ""
+    return objective
+
+
 __all__ = [
+    "objective_for",
     "Generator",
     "ScriptedGenerator",
     "AnthropicGenerator",
