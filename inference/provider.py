@@ -34,6 +34,7 @@ the pipeline needs to change. For example:
 from __future__ import annotations
 
 import importlib.util
+import re
 from abc import ABC, abstractmethod
 from collections import deque
 from pathlib import Path
@@ -42,6 +43,94 @@ from typing import Any, Callable, Iterable
 # Provider-neutral chat message. Backends map these onto their own API shape
 # (e.g. a "system" message becomes Anthropic's top-level `system` parameter).
 Message = dict[str, str]  # {"role": "system"|"user"|"assistant", "content": str}
+
+
+# --------------------------------------------------------------------------- #
+# HTTP error classification
+#
+# A target can fail two ways that must be handled OPPOSITELY: a 429 is transient
+# and should be waited out (the endpoint even tells you how long via
+# Retry-After), while a 401/403 is an auth failure that will never succeed no
+# matter how long you wait — retrying it just burns the backoff on every case
+# and reports a config error as a rate limit. The classifiers below let one
+# retry loop tell the two apart across every backend (a typed RestProvider
+# error, an OpenAI/Mistral SDKError with a status, a Bedrock ClientError).
+# --------------------------------------------------------------------------- #
+
+class TargetHTTPError(ValueError):
+    """An HTTP error from a REST target, carrying the status and Retry-After.
+
+    Subclasses ValueError so existing `except ValueError` handlers still catch
+    it, while `status_code` / `retry_after` let the retry loop act on it.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None,
+                 retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+def _http_status(exc: Exception) -> int | None:
+    """The HTTP status behind `exc`, however the backend surfaced it."""
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code
+    # SDKs (Mistral, OpenAI) and our RestProvider embed it in the message.
+    text = str(exc)
+    m = re.search(r"\b(?:HTTP|Status)\s+(\d{3})\b", text)
+    if m:
+        return int(m.group(1))
+    # Bedrock/botocore carry it in a response dict.
+    resp = getattr(exc, "response", None)
+    if isinstance(resp, dict):
+        meta = resp.get("ResponseMetadata") or {}
+        sc = meta.get("HTTPStatusCode")
+        if isinstance(sc, int):
+            return sc
+    return None
+
+
+def is_auth_error(exc: Exception) -> bool:
+    """True for a 401/403 — an auth/permission failure that will never succeed."""
+    if _http_status(exc) in (401, 403):
+        return True
+    text = str(exc).lower()
+    return "invalid api key" in text or "unauthorized" in text
+
+
+def is_rate_limit(exc: Exception) -> bool:
+    """True for a 429 / throttling error across SDK and HTTP shapes."""
+    if _http_status(exc) == 429:
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return ("429" in text or "too many requests" in text or "rate limit" in text
+            or "throttl" in text)
+
+
+def _retry_after(exc: Exception, default: float) -> float:
+    """Seconds to wait before retrying, from Retry-After if the target gave one.
+
+    Honouring the endpoint's own hint is both faster (no over-waiting) and
+    kinder (no hammering) than a blind exponential back-off. Capped so a
+    misbehaving header cannot stall the whole run.
+    """
+    hinted = getattr(exc, "retry_after", None)
+    if hinted is not None:
+        try:
+            return max(0.0, min(float(hinted), 60.0))
+        except (TypeError, ValueError):
+            pass
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers and hasattr(headers, "get"):
+        for key in ("retry-after", "Retry-After", "x-ratelimit-reset"):
+            val = headers.get(key)
+            if val:
+                try:
+                    return max(0.0, min(float(val), 60.0))
+                except (TypeError, ValueError):
+                    pass
+    return default
 
 
 # --------------------------------------------------------------------------- #
@@ -206,7 +295,21 @@ class Provider(ABC):
                 return self._postprocess(self._complete(messages))
             except Exception as exc:
                 last_exc = exc
-                if attempt < 2:
+                # An auth/permission failure will never succeed — retrying it
+                # just burns the backoff on every case and mislabels a config
+                # error as flakiness. Surface it immediately.
+                if is_auth_error(exc):
+                    raise
+                if attempt >= 2:
+                    break
+                # A 429 tells us how long to wait; honour it rather than a blind
+                # 1s/2s, which is far shorter than an enterprise endpoint's
+                # cooldown and is why bursts of 429s used to error out instead of
+                # riding out the limit. Other transient errors keep the fast
+                # exponential back-off.
+                if is_rate_limit(exc):
+                    _time.sleep(_retry_after(exc, default=min(2 ** attempt, 30)))
+                else:
                     _time.sleep(2 ** attempt)  # 1s, 2s
         raise last_exc
 
@@ -439,11 +542,17 @@ class RestProvider(Provider):
                 503: "Service unavailable. Try again later.",
             }
             hint = error_hints.get(resp.status_code, "Check the API endpoint and credentials.")
-            raise ValueError(
+            # Carry the status and Retry-After so generate()'s retry loop can
+            # wait out a 429 for exactly as long as the endpoint asks and fail
+            # fast on a 401 — instead of parsing this message back apart.
+            retry_after = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+            raise TargetHTTPError(
                 f"HTTP {resp.status_code} {resp.reason}\n"
                 f"URL: {url}\n"
                 f"Response: {resp.text[:500]}\n"
-                f"Hint: {hint}"
+                f"Hint: {hint}",
+                status_code=resp.status_code,
+                retry_after=retry_after,
             )
 
         # Parse and validate response
