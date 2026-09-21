@@ -25,6 +25,11 @@ class MultilingualStrategy(Strategy):
     id = "multilingual"
     description = "Uses the generation model to translate the attack into another language. Probes whether filters are English-centric. Costs one API call per prompt."
     uses_llm = True
+    # Never wrapped by an amplifier: the amplifiers are fixed English text, and
+    # putting English back around a translated attack reintroduces exactly the
+    # signal this strategy exists to remove. The composed variant would still
+    # run, and would quietly measure something other than what it claims to.
+    composable = False
 
     _NAMES: dict[str, str] = {
         "zh": "Mandarin Chinese", "es": "Spanish", "fr": "French",

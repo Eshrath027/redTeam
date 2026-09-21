@@ -1377,6 +1377,24 @@ SMOKE_CASE_IDS: tuple[str, ...] = (
 )
 
 
+def select_cases(
+    cases: "list[CalibrationCase] | None" = None, *, live: bool
+) -> list[CalibrationCase]:
+    """The cases a run in this mode will actually grade.
+
+    Parser-only cases are skipped in live mode and user-supplied (live-only)
+    cases in replay mode, so the two modes have different denominators: 111 and
+    109 for the built-in corpus today. Callers that only want to *report* the
+    count must ask here rather than taking `len(cases)`, or they print one
+    number and grade another — which is how the CLI came to announce 111 for a
+    run of 109, and the UI a hardcoded 107.
+    """
+    return [
+        c for c in (CASES if cases is None else cases)
+        if not (live and c.replay_only) and not (not live and c.live_only)
+    ]
+
+
 def smoke_check(judge: Judge) -> list[CaseOutcome]:
     """Grade the four unarguable cases with `judge`. Returns the wrong ones.
 
@@ -1413,6 +1431,14 @@ class CaseOutcome:
     #: How many of N samples were fully correct, when sampling was used.
     sample_passes: int = 1
     sample_total: int = 1
+    #: True when the case never reached the judge — a rate limit, an outage, a
+    #: transport failure. This is the corpus's own version of the rule the scan
+    #: path already holds: a case the judge could not be asked about is not
+    #: evidence about the judge either way, so it is reported as missing
+    #: coverage rather than counted as a wrong answer. Distinct from a judge
+    #: that WAS asked and returned no readable verdict — that is a real defect
+    #: and stays in the score as `ungraded`.
+    errored: bool = False
 
     @property
     def correct(self) -> bool:
@@ -1428,6 +1454,11 @@ class CaseOutcome:
         """How a wrong answer is wrong — the part that decides usability."""
         if self.correct:
             return ""
+        # Never reached the judge. Kept out of `ungraded`, which must keep
+        # meaning "the judge answered, and its answer was unreadable" — a real
+        # defect, where this is only a lost sample.
+        if self.errored:
+            return "errored"
         expected, actual = self.case.expected_passed, self.actual_passed
         if actual is expected:
             # Right verdict, wrong observations behind it. Not a bad finding
@@ -1585,13 +1616,13 @@ def _grade_once(case: CalibrationCase, judge) -> tuple[Any, list[str]]:
     return result, problems + _check(case, result)
 
 
-def _reduce(case: CalibrationCase, graded: list[tuple[Any, list[str]]]) -> CaseOutcome:
+def _reduce(case: CalibrationCase, graded: list[tuple[Any, list[str], bool]]) -> CaseOutcome:
     """Fold a case's samples into one outcome by majority."""
     clean = [g for g in graded if not g[1]]
     majority_correct = len(clean) * 2 > len(graded)
     # Report a sample from the majority side, so the mismatch shown is
     # representative rather than whichever sample happened to run first.
-    result, problems = (
+    result, problems, _ = (
         clean[0] if majority_correct
         else next((g for g in graded if g[1]), graded[0])
     )
@@ -1603,6 +1634,9 @@ def _reduce(case: CalibrationCase, graded: list[tuple[Any, list[str]]]) -> CaseO
         axes=result.axes,
         sample_passes=len(clean),
         sample_total=len(graded),
+        # Only when the judge was never successfully reached on any sample. One
+        # good sample means the case has a real answer and belongs in the score.
+        errored=all(g[2] for g in graded),
     )
 
 
@@ -1664,10 +1698,7 @@ def run_corpus(
 
     live = judge_factory is not None
     samples = max(1, int(samples))
-    selected = [
-        c for c in (CASES if cases is None else cases)
-        if not (live and c.replay_only) and not (not live and c.live_only)
-    ]
+    selected = select_cases(cases, live=live)
 
     # Circuit breaker. Retrying is right for a transient burst limit, wrong for a
     # quota that is already spent — a free tier that 429s every call would burn
@@ -1679,20 +1710,22 @@ def run_corpus(
     state = {"exhausted": 0, "tripped": False, "noticed": False}
     _RATE_LIMIT_TRIP = 3  # cases that must exhaust retries before we give up
 
-    def _one_sample(case: CalibrationCase) -> tuple[Any, list[str]]:
+    def _one_sample(case: CalibrationCase) -> tuple[Any, list[str], bool]:
+        # The third element marks "the judge was never reached", which keeps the
+        # case out of the accuracy denominator instead of scoring it as a miss.
         if state["tripped"]:
             msg = "skipped: provider rate-limited (circuit breaker open)"
-            return GraderResult(passed=None, score=0.0, reason=msg), [msg]
+            return GraderResult(passed=None, score=0.0, reason=msg), [msg], True
 
         judge = judge_factory(case) if live else _ReplayJudge(case.replay_reply)
         for attempt in range(max_retries + 1):
             try:
-                return _grade_once(case, judge)
+                return (*_grade_once(case, judge), False)
             except Exception as exc:  # noqa: BLE001 — a backend failure is a result too
                 # Any non-rate-limit error is a real result: return it now.
                 if not _is_rate_limit(exc):
                     err = f"{type(exc).__name__}: {exc}"
-                    return GraderResult(passed=None, score=0.0, reason=err), [err]
+                    return GraderResult(passed=None, score=0.0, reason=err), [err], True
                 # A rate limit with retries left: back off (Retry-After if given)
                 # and try again, announcing it once so the wait is not silent.
                 if attempt < max_retries:
@@ -1715,11 +1748,11 @@ def run_corpus(
                       f"marked ungraded. Use a paid tier or a local model.",
                       flush=True)
         err = "rate limited: exhausted retries"
-        return GraderResult(passed=None, score=0.0, reason=err), [err]
+        return GraderResult(passed=None, score=0.0, reason=err), [err], True
 
     # (case_index, case) x samples, flattened so every call is one pool unit.
     units = [(i, case) for i, case in enumerate(selected) for _ in range(samples)]
-    per_case: dict[int, list[tuple[Any, list[str]]]] = {i: [] for i in range(len(selected))}
+    per_case: dict[int, list[tuple[Any, list[str], bool]]] = {i: [] for i in range(len(selected))}
 
     workers = min(max(1, concurrency), len(units)) or 1
     if workers == 1:
@@ -1743,15 +1776,35 @@ def summarize(outcomes: list[CaseOutcome]) -> dict[str, Any]:
     for o in outcomes:
         if o.failure_mode:
             modes[o.failure_mode] = modes.get(o.failure_mode, 0) + 1
+        # A detector whose cases never reached the judge is not a weak detector.
+        # Counting them made a rate-limited run report every detector in the
+        # corpus as having "at least one miss".
+        if o.errored:
+            continue
         bucket = by_detector.setdefault(o.case.detector_id, {"total": 0, "correct": 0})
         bucket["total"] += 1
         bucket["correct"] += int(o.correct)
 
     correct = sum(1 for o in outcomes if o.correct)
+    # Cases the judge was never reached on (rate limit, outage) are coverage
+    # lost, not wrong answers. Scoring them as misses reports an infrastructure
+    # failure as a judge defect: a run that died after 40 of 109 cases read as
+    # "37% accuracy" when the judge had in fact answered 40 of 40 correctly.
+    # The scan path already excludes ungradeable cases from its rate for the
+    # same reason; this is that rule applied to the corpus.
+    errored = sum(1 for o in outcomes if o.errored)
+    scored = len(outcomes) - errored
     return {
         "cases": len(outcomes),
         "correct": correct,
-        "accuracy": round(correct / len(outcomes), 3) if outcomes else 0.0,
+        # Over cases that reached the judge. Read it with `coverage`: an
+        # accuracy over a handful of cases is not a verdict on the model.
+        "accuracy": round(correct / scored, 3) if scored else 0.0,
+        "scored": scored,
+        # Cases that never reached the judge, and the share that did. A run
+        # below full coverage has not measured the judge, whatever it scored.
+        "errored": errored,
+        "coverage": round(scored / len(outcomes), 3) if outcomes else 0.0,
         # False positives are the expensive ones: they reach the customer as
         # findings that are not real.
         "false_positives": modes.get("false_positive", 0),
@@ -1790,6 +1843,12 @@ def to_dict(
             "cases": summary["cases"],
             "correct": summary["correct"],
             "accuracy": summary["accuracy"],
+            # Denominator of `accuracy`, and what fraction of the corpus it is.
+            # A consumer that shows accuracy without coverage will present a
+            # collapsed run as a judge verdict.
+            "scored": summary["scored"],
+            "errored": summary["errored"],
+            "coverage": summary["coverage"],
             # Split, not merged: an accuracy number hides which direction the
             # judge is wrong in, and that is the part that decides usability.
             "false_positives": summary["false_positives"],
@@ -1847,8 +1906,15 @@ def _print_report(outcomes: list[CaseOutcome], summary: dict[str, Any], mode: st
                 print(f"         judge said: {o.reason[:150]}")
 
     print("-" * 62)
-    print(f"  cases {summary['cases']}   correct {summary['correct']}   "
-          f"accuracy {summary['accuracy']:.0%}")
+    if summary["errored"]:
+        print(f"  INCONCLUSIVE — only {summary['scored']} of {summary['cases']} "
+              f"cases reached the judge ({summary['coverage']:.0%} coverage).")
+        print(f"  {summary['errored']} case(s) failed to grade (rate limit or "
+              f"provider error). The figures below cover the graded cases only "
+              f"and are NOT a verdict on this judge.")
+    print(f"  cases {summary['cases']}   scored {summary['scored']}   "
+          f"correct {summary['correct']}   accuracy {summary['accuracy']:.0%}"
+          + ("  (of scored)" if summary["errored"] else ""))
     print(f"  false positives {summary['false_positives']}  "
           f"(fabricated findings — the expensive kind)")
     print(f"  false negatives {summary['false_negatives']}  "

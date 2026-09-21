@@ -93,18 +93,93 @@ def get_strategy(spec: "str | dict[str, Any]") -> Strategy:
     return cls(**config)
 
 
+def default_amplifier() -> "Strategy | None":
+    """The registry's amplifier strategy, or None if none is marked.
+
+    An amplifier says nothing about *what* an attack asks for — it only strips
+    the model's hedging — so it multiplies every framing rather than competing
+    with them. Measured by AttackForge on the same technique: composing
+    refusal-suppression over a framing took `direct_request` from 50% to 83%
+    and `tool_name_instruction` from 0% to 100%.
+    """
+    for cls in _REGISTRY.values():
+        if getattr(cls, "amplifier", False):
+            return cls()
+    return None
+
+
+def split_amplifier(
+    strategies: list[Strategy],
+) -> "tuple[Strategy | None, list[Strategy]]":
+    """Separate an explicitly-selected amplifier from the peer framings.
+
+    Only the first amplifier counts; two of them would stack wrappers that each
+    claim the outermost layer.
+    """
+    amplifier: Strategy | None = None
+    framings: list[Strategy] = []
+    for strategy in strategies:
+        if strategy.amplifier and amplifier is None:
+            amplifier = strategy
+        else:
+            framings.append(strategy)
+    return amplifier, framings
+
+
+def plan_composition(
+    strategies: list[Strategy], *, compose: bool = True
+) -> "tuple[Strategy | None, list[Strategy]]":
+    """Resolve (amplifier, strategies-that-each-take-a-slot) for a run.
+
+    One planner for both runners, so the CLI and the config runner cannot drift
+    on what a configured strategy list expands to.
+
+    With `compose` on, the amplifier wraps every framing that accepts one. It is
+    applied whether or not the user listed it: stripping the model's hedging is
+    orthogonal to the framing, so a run that asks for `fiction` gets the stronger
+    `fiction+refusal-suppression` rather than the weaker half of it.
+
+    **The slot count never changes.** It is always `len(strategies)`:
+
+      * listed explicitly — the amplifier keeps a slot of its own (applied bare,
+        over the unframed prompt) and the remaining framings are wrapped. That
+        bare cell is what lets a `fiction+refusal-suppression` break be
+        attributed to the framing rather than to the amplifier.
+      * not listed — it is a wrapper only and takes no slot, so asking for two
+        strategies still costs two variants per case.
+
+    `compose=False` disables wrapping entirely and restores the flat peer
+    expansion — what a run being compared against an older one needs, and the
+    way to A/B whether composition helps against *your* target.
+    """
+    if not compose:
+        return None, list(strategies)
+    explicit, framings = split_amplifier(strategies)
+    if explicit is not None:
+        return explicit, [explicit, *framings]
+    return default_amplifier(), list(strategies)
+
+
 def apply_strategies(
     cases: list[TestCase],
     strategies: list[Strategy],
     generator: "Any | None" = None,
+    *,
+    compose: bool = True,
 ) -> list[TestCase]:
     """Apply all strategies to a list of test cases.
 
     Returns the original cases first, followed by all strategy-augmented cases.
+    See `plan_composition` for how an amplifier is folded in.
     """
+    amplifier, ordered = plan_composition(strategies, compose=compose)
     result = list(cases)
-    for strategy in strategies:
-        result.extend(strategy.apply_to_cases(cases, generator=generator))
+    for strategy in ordered:
+        # `amplified_by` drops the amplifier for the cases that must not carry
+        # it: itself, an interactive seed, and any strategy that opts out.
+        result.extend(
+            strategy.apply_to_cases(cases, generator=generator, amplifier=amplifier)
+        )
     return result
 
 
@@ -123,4 +198,7 @@ __all__ = [
     "ConversationalJailbreakStrategy",
     "get_strategy",
     "apply_strategies",
+    "plan_composition",
+    "split_amplifier",
+    "default_amplifier",
 ]

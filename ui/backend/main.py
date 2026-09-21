@@ -377,6 +377,20 @@ class CheckJudgeRequest(BaseModel):
     concurrency: int = 3
 
 
+@app.get("/api/calibration")
+def calibration_size():
+    """How many cases a judge check will grade.
+
+    Served rather than written into the page: the corpus grows, and a number
+    typed into the UI silently goes stale (it read 107 while the run graded 109).
+    """
+    from detectors.calibration import CASES, select_cases
+    return {
+        "live_cases":  len(select_cases(live=True)),
+        "total_cases": len(CASES),
+    }
+
+
 @app.post("/api/check-judge")
 async def check_judge(req: CheckJudgeRequest):
     if not (req.config.get("grading")):

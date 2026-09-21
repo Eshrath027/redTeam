@@ -35,7 +35,11 @@ from plugins import (
     builtin_dataset_path, category_for_plugin, get_plugin, has_builtin_dataset,
     resolve_plugin_ids,
 )
-from strategies import _REGISTRY as _STRATEGY_REGISTRY, get_strategy
+from strategies import (
+    _REGISTRY as _STRATEGY_REGISTRY,
+    get_strategy,
+    plan_composition,
+)
 
 #: Detector ids with a dedicated grader, resolved once at import.
 _DETECTOR_IDS = frozenset(all_detector_ids())
@@ -219,7 +223,8 @@ def _check_judge(cfg, cases_path: str | None, output_path: str | None,
     (`-o -` writes it to stdout), so a CI job or a dashboard can consume it.
     """
     from detectors.calibration import (
-        CASES, cases_from, run_corpus, summarize, to_dict, _print_report,
+        CASES, cases_from, run_corpus, select_cases, summarize, to_dict,
+        _print_report,
     )
 
     to_stdout = output_path == "-"
@@ -243,8 +248,13 @@ def _check_judge(cfg, cases_path: str | None, output_path: str | None,
     if not quiet:
         print(f"Scoring grading model: {judge_name}\n")
     if not quiet:
-        print(f"Grading {len(cases)} case(s) x {samples} sample(s) "
-              f"at concurrency {concurrency}…")
+        # The count the run will really grade: --check-judge is always live, so
+        # the parser-only cases are skipped and must not be announced.
+        n_live = len(select_cases(cases, live=True))
+        skipped = len(cases) - n_live
+        note = f" ({skipped} parser-only case(s) skipped in live mode)" if skipped else ""
+        print(f"Grading {n_live} case(s) x {samples} sample(s) "
+              f"at concurrency {concurrency}…{note}")
     outcomes = run_corpus(judge_factory=lambda _case: cfg.grading, cases=cases,
                           samples=samples, concurrency=concurrency)
     summary = summarize(outcomes)
@@ -259,8 +269,18 @@ def _check_judge(cfg, cases_path: str | None, output_path: str | None,
         else:
             Path(output_path).write_text(payload + "\n", encoding="utf-8")
             print(f"Judge calibration → {output_path}")
-            print(f"  {summary['correct']}/{summary['cases']} correct  "
-                  f"({summary['false_positives']} false positive(s), "
+            # Scored, not total: a case the provider never answered is missing
+            # coverage, not a wrong answer. Dividing by the corpus size reports
+            # a rate limit as a judge that got worse.
+            if summary["errored"]:
+                print(f"  INCONCLUSIVE — only {summary['scored']} of "
+                      f"{summary['cases']} cases reached the judge "
+                      f"({summary['coverage']:.0%} coverage); "
+                      f"{summary['errored']} failed to grade. Re-run with a "
+                      f"lower --concurrency to score the full corpus.")
+            print(f"  {summary['correct']}/{summary['scored']} correct"
+                  + ("  (of the cases graded)" if summary["errored"] else "")
+                  + f"  ({summary['false_positives']} false positive(s), "
                   f"{summary['false_negatives']} false negative(s))")
     else:
         _print_report(outcomes, summary, f"live ({judge_name})")
@@ -372,6 +392,11 @@ def _save_prompts(path: Path, purpose: str, strategy_ids: list[str], cases: list
 
 def _run_plugin_with_topup(plugin, file_base: list) -> tuple:
     t0 = time.perf_counter()
+    # The config decides how many cases run, in both directions. Topping up a
+    # short file was already handled; a file holding *more* than `num_tests` used
+    # to run in full, so asking for 6 against a 10-prompt file quietly bought 10
+    # targets calls and 10 grading calls. Trim first, then top up what is left.
+    file_base = file_base[: plugin.num_tests]
     shortfall = max(0, plugin.num_tests - len(file_base))
     if shortfall > 0:
         orig = plugin.num_tests
@@ -385,12 +410,15 @@ def _run_plugin_with_topup(plugin, file_base: list) -> tuple:
     return plugin, file_base + new_cases, round(time.perf_counter() - t0, 2)
 
 
-def _strategy_variant(case, strategy, generator):
+def _strategy_variant(case, strategy, generator, amplifier=None):
     """One strategy variant of one case — the unit of work for the pool.
 
-    Delegates to apply_to_cases so TestCase bookkeeping stays in one place.
+    Delegates to apply_to_cases so TestCase bookkeeping (and amplifier
+    composition) stays in one place.
     """
-    return strategy.apply_to_cases([case], generator=generator)[0]
+    return strategy.apply_to_cases(
+        [case], generator=generator, amplifier=amplifier
+    )[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -687,28 +715,73 @@ def main(argv: list[str] | None = None) -> None:
     # across every plugin goes into one pool instead of three nested serial loops.
     plan: list[tuple] = []      # (plugin, base_cases, file_strat, slots)
     llm_units: list[tuple] = []  # (plugin_i, slot_i, case_i, case, strategy)
+    # Cached cases the config no longer wants. Counted rather than silently
+    # discarded: a smaller run than the file implies should be stated.
+    dropped_strategies: dict[str, int] = {}
+    dropped_orphans: dict[str, int] = {}
 
     for p_i, (plugin, base_cases) in enumerate(all_plugin_results):
-        file_strat = [tc for tc in file_cases.get(plugin.id, [])
-                      if tc.metadata.get("strategy")]
-        done = {tc.metadata["strategy"] for tc in file_strat}
-
         # Use per-plugin strategies if defined, otherwise fall back to global strategies
         plugin_strategies = plugin.strategies if hasattr(plugin, 'strategies') and plugin.strategies else cfg.strategies
 
-        missing = [s for s in plugin_strategies if s.id not in done]
+        # A cached variant is kept only when the config still asks for it, and
+        # only while the base prompt it was built from survived the num_tests
+        # trim. Without the first test a strategy removed from the config kept
+        # running off the file; without the second, trimming the base set left
+        # variants of prompts that are no longer in the run.
+        configured = {s.id for s in plugin_strategies}
+        kept_base = {tc.prompt for tc in base_cases}
+        file_strat = []
+        for tc in file_cases.get(plugin.id, []):
+            sid = tc.metadata.get("strategy")
+            if not sid:
+                continue
+            if sid not in configured:
+                dropped_strategies[sid] = dropped_strategies.get(sid, 0) + 1
+                continue
+            # A hand-written or pre-1.0 file may carry no seed link. It cannot be
+            # aligned, so it is kept rather than thrown away on a guess.
+            origin = tc.metadata.get("original_prompt")
+            if origin is not None and origin not in kept_base:
+                dropped_orphans[plugin.id] = dropped_orphans.get(plugin.id, 0) + 1
+                continue
+            file_strat.append(tc)
+        done = {tc.metadata["strategy"] for tc in file_strat}
+
+        # The amplifier wraps each framing rather than running beside it; the
+        # slot count is unchanged either way. Same planner as run.py, so the two
+        # runners cannot disagree about what a strategy list expands to.
+        amplifier, to_apply = plan_composition(
+            plugin_strategies, compose=cfg.compose_strategies
+        )
+
+        # A cached variant is replayed exactly as saved — the prompts file is a
+        # cache of literal prompts, so a strategy present in the file is a hit
+        # whether or not it was amplified when it was written. Composition
+        # applies to prompts being built, never to prompts being replayed.
+        missing = [s for s in to_apply if s.id not in done]
 
         slots: list[list] = []
         for s_i, strat in enumerate(missing):
             if strat.uses_llm:
                 slots.append([None] * len(base_cases))
                 llm_units.extend(
-                    (p_i, s_i, c_i, case, strat)
+                    (p_i, s_i, c_i, case, strat, amplifier)
                     for c_i, case in enumerate(base_cases)
                 )
             else:
-                slots.append(strat.apply_to_cases(base_cases, generator=cfg.generation))
+                slots.append(strat.apply_to_cases(
+                    base_cases, generator=cfg.generation, amplifier=amplifier))
         plan.append((plugin, base_cases, file_strat, slots))
+
+    if dropped_strategies:
+        detail = ", ".join(f"{sid} ({n})" for sid, n in sorted(dropped_strategies.items()))
+        print(f"Dropped {sum(dropped_strategies.values())} cached case(s) for "
+              f"strategies this config does not ask for: {detail}")
+    if dropped_orphans:
+        detail = ", ".join(f"{pid} ({n})" for pid, n in sorted(dropped_orphans.items()))
+        print(f"Dropped {sum(dropped_orphans.values())} cached variant(s) whose "
+              f"base prompt fell outside num_tests: {detail}")
 
     if llm_units:
         n_units = len(llm_units)
@@ -718,8 +791,8 @@ def main(argv: list[str] | None = None) -> None:
         failed = 0
         with ThreadPoolExecutor(max_workers=strat_conc) as pool:
             futures = {
-                pool.submit(_strategy_variant, case, strat, cfg.generation): (p_i, s_i, c_i)
-                for p_i, s_i, c_i, case, strat in llm_units
+                pool.submit(_strategy_variant, case, strat, cfg.generation, amp): (p_i, s_i, c_i)
+                for p_i, s_i, c_i, case, strat, amp in llm_units
             }
             for done_n, future in enumerate(as_completed(futures), 1):
                 p_i, s_i, c_i = futures[future]
@@ -755,6 +828,13 @@ def main(argv: list[str] | None = None) -> None:
         for sid, s in interactive_strategies.items():
             print(f"Adaptive strategy '{sid}' enabled "
                   f"(up to {getattr(s, 'max_turns', '?')} turns per case)")
+
+    global_amp, _ = plan_composition(
+        cfg.strategies, compose=cfg.compose_strategies
+    )
+    if global_amp is not None and cfg.strategies:
+        print(f"Composing '{global_amp.id}' as an outer layer over every other "
+              f"strategy (same case count; set compose_strategies: false to disable)")
 
     # --- save prompts file (before hitting the target) -----------------------
     if save_prompts_path:
@@ -1083,6 +1163,33 @@ def main(argv: list[str] | None = None) -> None:
     for counts in by_framework.values():
         counts["pass_rate"] = _pass_rate(counts)
 
+    # by_strategy — attack success rate per strategy, against the unmodified
+    # baseline. Every other breakdown answers "how exposed is the target";
+    # this one answers "is our attack tooling any good", which is the only way
+    # to tell a hardened target from a strategy that stopped working. Baseline
+    # cases carry no strategy and bucket under "none" so the comparison — the
+    # lift a strategy buys over sending the raw prompt — is on the same table.
+    by_strategy: dict[str, dict] = {}
+    for rec in all_records:
+        bucket = by_strategy.setdefault(
+            rec.get("strategy") or "none",
+            {"total": 0, "vulnerable": 0, "errored": 0},
+        )
+        bucket["total"] += 1
+        if rec.get("passed") is None:
+            bucket["errored"] += 1
+        elif not rec["passed"]:
+            bucket["vulnerable"] += 1
+    for counts in by_strategy.values():
+        counts["pass_rate"] = _pass_rate(counts)
+        # The headline number, stored explicitly rather than left as
+        # 1 - pass_rate: an errored case is in neither, and a reader doing that
+        # subtraction by hand gets it wrong whenever any case errored.
+        decided_n = counts["total"] - counts["errored"]
+        counts["attack_success_rate"] = (
+            round(counts["vulnerable"] / decided_n, 3) if decided_n else 0.0
+        )
+
     # by_target — per-target pass/fail breakdown (most useful in multi-target runs)
     by_target: dict[str, dict] = {}
     for rec in all_records:
@@ -1107,6 +1214,7 @@ def main(argv: list[str] | None = None) -> None:
         "pass_rate":    round((decided - vulnerable) / decided, 3) if decided else 0.0,
         "by_plugin":    by_plugin,
         "by_framework": by_framework or None,
+        "by_strategy":  by_strategy or None,
         "by_target":    by_target if is_multi else None,
     }
 
@@ -1154,6 +1262,34 @@ def main(argv: list[str] | None = None) -> None:
         print("\nBy framework:")
         for fw, b in by_framework.items():
             print(f"  {fw:<20}  {b['vulnerable']}/{b['total']} vulnerable")
+
+    # Only worth printing when a strategy actually ran: with no strategies the
+    # single "none" row just restates the totals above.
+    if len(by_strategy) > 1:
+        print("\nBy strategy (attack success rate):")
+        baseline = by_strategy.get("none")
+        col = max(len(s) for s in by_strategy) + 2
+        # Baseline first, then the rest strongest-first — the ordering a reader
+        # wants when deciding which strategies are earning their API calls.
+        ordered = sorted(
+            by_strategy.items(),
+            key=lambda kv: (kv[0] != "none", -kv[1]["attack_success_rate"]),
+        )
+        for sid, b in ordered:
+            decided_n = b["total"] - b["errored"]
+            lift = ""
+            if baseline is not None and sid != "none":
+                delta = b["attack_success_rate"] - baseline["attack_success_rate"]
+                lift = f"   {delta:+.0%} vs baseline"
+            err = f"  ({b['errored']} errored)" if b["errored"] else ""
+            print(f"  {sid:<{col}} {b['attack_success_rate']:>5.0%}  "
+                  f"({b['vulnerable']}/{decided_n}){err}{lift}")
+        # A rate over a handful of cases is mostly sampling noise, and a strategy
+        # comparison invites exactly that misreading — so say it rather than
+        # letting two single-digit numbers look like a result.
+        if min(b["total"] - b["errored"] for b in by_strategy.values()) < 20:
+            print("  note: fewer than 20 decided cases in some buckets — these "
+                  "rates carry wide error bars; raise --num-tests to compare.")
 
     if is_multi:
         print("\nBy target (comparison):")

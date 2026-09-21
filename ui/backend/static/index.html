@@ -568,6 +568,10 @@ button{cursor:pointer}
           <label>AWS Region</label>
           <input id="target-region" type="text" placeholder="us-east-1">
         </div>
+        <div class="field" id="target-endpoint-field" style="display:none">
+          <label>Endpoint URL (optional — VPC/PrivateLink)</label>
+          <input id="target-endpoint" type="text" placeholder="https://vpce-….bedrock-runtime.us-east-1.vpce.amazonaws.com">
+        </div>
         <div class="field">
           <label>API Key</label>
           <input id="target-key" type="password" placeholder="sk-…  (optional)">
@@ -727,6 +731,10 @@ button{cursor:pointer}
           <label>AWS Region</label>
           <input id="gen-region" type="text" placeholder="us-east-1">
         </div>
+        <div class="field" id="gen-endpoint-field" style="display:none">
+          <label>Endpoint URL (optional — VPC/PrivateLink)</label>
+          <input id="gen-endpoint" type="text" placeholder="https://vpce-….bedrock-runtime.us-east-1.vpce.amazonaws.com">
+        </div>
       </div>
     </div>
 
@@ -758,6 +766,10 @@ button{cursor:pointer}
         <div class="field" id="grade-region-field" style="display:none">
           <label>AWS Region</label>
           <input id="grade-region" type="text" placeholder="us-east-1">
+        </div>
+        <div class="field" id="grade-endpoint-field" style="display:none">
+          <label>Endpoint URL (optional — VPC/PrivateLink)</label>
+          <input id="grade-endpoint" type="text" placeholder="https://vpce-….bedrock-runtime.us-east-1.vpce.amazonaws.com">
         </div>
         <div class="field" id="grade-url-field" style="display:none">
           <label>Base URL (for local/OpenAI-compatible)</label>
@@ -935,18 +947,24 @@ let categoryCustomizations = {};
 let pluginCustomizations = {};
 let frameworkCustomizations = {};
 let genBackend = 'anthropic', gradeBackend = 'anthropic';
+// Size of the judge calibration corpus, served by the backend so it tracks the
+// corpus instead of being a literal that goes stale as cases are added.
+let calibrationCases = 0;
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 async function init() {
   try {
-    const [pl, cat, st, fw, langs] = await Promise.all([
+    const [pl, cat, st, fw, langs, cal] = await Promise.all([
       fetch(`${API}/api/plugins`).then(r => r.json()),
       fetch(`${API}/api/categories`).then(r => r.json()),
       fetch(`${API}/api/strategies`).then(r => r.json()),
       fetch(`${API}/api/frameworks`).then(r => r.json()),
       fetch(`${API}/api/languages`).then(r => r.json()),
+      // Non-fatal: the spinner falls back to an approximate count.
+      fetch(`${API}/api/calibration`).then(r => r.json()).catch(() => ({})),
     ]);
     plugins = pl; categories = cat; strategies = st; frameworks = fw; languages = langs;
+    calibrationCases = cal.live_cases || 0;
     console.log('Frameworks loaded:', frameworks);
     renderLanguages(langs);
     renderFrameworks();
@@ -1467,9 +1485,18 @@ function buildConfig() {
     custom: 'local-model'
   };
 
+  // What-you-see-is-what-runs: an empty model field resolves to the placeholder
+  // the user is actually looking at (set per-backend in onGen/GradeBackendChange),
+  // and only then to the hardcoded default — otherwise the field can show one
+  // model as a hint while the run silently uses another.
+  const modelOf = (id, backend) => {
+    const el = document.getElementById(id);
+    return el.value.trim() || (el.placeholder || '').trim() || defaultModels[backend];
+  };
+
   const generation = {
     backend: genBackend,
-    model: document.getElementById('gen-model').value.trim() || defaultModels[genBackend]
+    model: modelOf('gen-model', genBackend)
   };
   const gk = document.getElementById('gen-key').value.trim();
   if (gk) generation.api_key = gk;
@@ -1477,10 +1504,12 @@ function buildConfig() {
   if (gu && genBackend === 'custom') generation.base_url = gu;
   const gr = document.getElementById('gen-region').value.trim();
   if (gr && genBackend === 'bedrock') generation.region = gr;
+  const gep = document.getElementById('gen-endpoint').value.trim();
+  if (gep && genBackend === 'bedrock') generation.endpoint_url = gep;
 
   const grading = {
     backend: gradeBackend,
-    model: document.getElementById('grade-model').value.trim() || defaultModels[gradeBackend]
+    model: modelOf('grade-model', gradeBackend)
   };
   const grk = document.getElementById('grade-key').value.trim();
   if (grk) grading.api_key = grk;
@@ -1488,6 +1517,8 @@ function buildConfig() {
   if (gru && (gradeBackend === 'custom' || gradeBackend === 'local')) grading.base_url = gru;
   const grr = document.getElementById('grade-region').value.trim();
   if (grr && gradeBackend === 'bedrock') grading.region = grr;
+  const grep = document.getElementById('grade-endpoint').value.trim();
+  if (grep && gradeBackend === 'bedrock') grading.endpoint_url = grep;
   // Only meaningful for the OpenAI-compatible grader; omit unless checked so the
   // default (rubric mode, for general models) stays clean in the config.
   if (document.getElementById('grade-gated').checked && (gradeBackend === 'custom' || gradeBackend === 'local')) {
@@ -1516,6 +1547,8 @@ function buildConfig() {
   if (tk) target.api_key = tk;
   const tr = document.getElementById('target-region').value.trim();
   if (tr && targetType === 'bedrock') target.region = tr;
+  const tep = document.getElementById('target-endpoint').value.trim();
+  if (tep && targetType === 'bedrock') target.endpoint_url = tep;
 
   // REST custom API (user-provided)
   if (targetType === 'rest') {
@@ -1666,7 +1699,7 @@ async function checkJudge() {
   document.getElementById('judge-content').innerHTML =
     `<div class="empty-state"><div class="icon">⏳</div>
      <p>Scoring <b>${esc((cfg.grading||{}).model || '?')}</b> against the calibration corpus…</p>
-     <p style="font-size:12px;color:var(--text-muted)">grading ~107 cases; this takes a minute.</p></div>`;
+     <p style="font-size:12px;color:var(--text-muted)">grading ${calibrationCases || '~110'} cases; this takes a minute.</p></div>`;
   try {
     const res = await fetch(`${API}/api/check-judge`, {
       method: 'POST',
@@ -1690,27 +1723,43 @@ async function checkJudge() {
 
 function renderJudge(d) {
   const s = d.summary || {};
-  const graded = s.cases || 0;
-  const acc = graded ? Math.round((s.accuracy||0)*100) : 0;
-  const trust = s.false_positives === 0 && s.false_negatives === 0;
+  const total = s.cases || 0;
+  // Cases that actually reached the judge. Older reports have no `scored`, so
+  // fall back to the case count.
+  const scored = (s.scored === undefined) ? total : s.scored;
+  const errored = s.errored || 0;
+  const acc = scored ? Math.round((s.accuracy||0)*100) : 0;
+  // Zero false positives and zero false negatives prove nothing when most of
+  // the corpus never ran — an unreachable provider would score exactly that.
+  // A trust verdict requires full coverage.
+  const complete = errored === 0 && scored > 0;
+  const trust = complete && s.false_positives === 0 && s.false_negatives === 0;
   const cards = [
-    `<div class="stat-card"><div class="num">${s.correct||0}/${graded}</div><div class="lbl">Correct</div></div>`,
+    `<div class="stat-card"><div class="num">${s.correct||0}/${scored}</div><div class="lbl">Correct${errored ? '<br><span style="font-size:9px">of cases graded</span>' : ''}</div></div>`,
+    errored ? `<div class="stat-card danger"><div class="num">${errored}</div><div class="lbl">Not graded<br><span style="font-size:9px">never reached the judge</span></div></div>` : '',
     `<div class="stat-card ${s.false_positives ? 'danger':''}"><div class="num">${s.false_positives||0}</div><div class="lbl">False positives<br><span style="font-size:9px">fabricated findings</span></div></div>`,
     `<div class="stat-card ${s.false_negatives ? 'danger':''}"><div class="num">${s.false_negatives||0}</div><div class="lbl">False negatives<br><span style="font-size:9px">missed breaks</span></div></div>`,
     s.wrong_reasoning ? `<div class="stat-card"><div class="num" style="color:#FBBF24">${s.wrong_reasoning}</div><div class="lbl">Wrong reasoning</div></div>` : '',
     (s.unstable && Object.keys(s.unstable).length) ? `<div class="stat-card"><div class="num" style="color:#FBBF24">${Object.keys(s.unstable).length}</div><div class="lbl">Unstable</div></div>` : '',
-    `<div class="stat-card"><div class="num">${acc}%</div><div class="lbl">Accuracy</div></div>`,
+    `<div class="stat-card"><div class="num">${acc}%</div><div class="lbl">Accuracy${errored ? '<br><span style="font-size:9px">of cases graded</span>' : ''}</div></div>`,
   ].join('');
 
   const weak = Object.entries(s.by_detector||{})
     .filter(([,v]) => v.correct < v.total)
     .map(([k]) => k).sort();
 
-  const banner = trust
+  // An incomplete run gets no verdict in either direction: it did not measure
+  // the judge, so calling it trustworthy or unreliable would both be invented.
+  const banner = !complete
+    ? `<div class="reason-row why-err" style="padding:10px;border-radius:8px;margin:8px 0"><span class="reason-lbl">INCONCLUSIVE</span> Only ${scored} of ${total} cases reached the judge — ${errored} failed to grade (usually a provider rate limit). This is not a verdict on ${esc((d.grading_model)||'')}. Re-run with a lower concurrency to score the full corpus.</div>`
+    : trust
     ? `<div class="reason-row why-safe" style="padding:10px;border-radius:8px;margin:8px 0"><span class="reason-lbl">TRUSTWORTHY</span> ${esc((d.grading_model)||'')} made no fabricated findings and missed no breaks on the corpus.</div>`
     : `<div class="reason-row why-vuln" style="padding:10px;border-radius:8px;margin:8px 0"><span class="reason-lbl">USE WITH CARE</span> ${esc((d.grading_model)||'')} was wrong on ${(s.false_positives||0)+(s.false_negatives||0)} case(s). Findings on the weak detectors below may not be reliable.</div>`;
 
-  const misses = (d.cases||[]).filter(c => !c.correct);
+  // Cases that never reached the judge are reported by the banner as lost
+  // coverage, not listed here — they are not misses and padding the list with
+  // them buries the real ones.
+  const misses = (d.cases||[]).filter(c => !c.correct && c.failure_mode !== 'errored');
   const missRows = misses.map(c => {
     const cls = c.failure_mode === 'false_positive' ? 'why-vuln'
       : c.failure_mode === 'false_negative' ? 'why-vuln' : 'why-err';
@@ -2000,6 +2049,7 @@ function onGenBackendChange() {
   const v = document.getElementById('gen-backend').value;
   document.getElementById('gen-url-field').style.display = v === 'custom' ? '' : 'none';
   document.getElementById('gen-region-field').style.display = v === 'bedrock' ? '' : 'none';
+  document.getElementById('gen-endpoint-field').style.display = v === 'bedrock' ? '' : 'none';
   document.getElementById('gen-key').placeholder = v === 'bedrock' ? 'Bedrock API key (blank = AWS credentials)' : 'sk-…';
   const models = {anthropic:'claude-opus-4-8',mistral:'mistral-large-2512',openai:'gpt-4o',bedrock:'us.anthropic.claude-sonnet-4-20250514-v1:0',custom:''};
   document.getElementById('gen-model').placeholder = models[v] || '';
@@ -2009,6 +2059,7 @@ function onGradeBackendChange() {
   const v = document.getElementById('grade-backend').value;
   document.getElementById('grade-url-field').style.display = (v === 'custom' || v === 'local') ? '' : 'none';
   document.getElementById('grade-region-field').style.display = v === 'bedrock' ? '' : 'none';
+  document.getElementById('grade-endpoint-field').style.display = v === 'bedrock' ? '' : 'none';
   document.getElementById('grade-key').placeholder = v === 'bedrock' ? 'Bedrock API key (blank = AWS credentials)' : 'sk-…';
   const models = {anthropic:'claude-opus-4-8',mistral:'mistral-large-2512',openai:'gpt-4o-mini',bedrock:'us.anthropic.claude-sonnet-4-20250514-v1:0',custom:'your-model',local:'red-team-evaluator'};
   document.getElementById('grade-model').placeholder = models[v] || '';
@@ -2022,6 +2073,7 @@ function syncTargetTypeUI() {
 
   document.getElementById("target-name-field").style.display = (v === "openai" || v === "anthropic" || v === "mistral" || v === "bedrock") ? "" : "none";
   document.getElementById("target-region-field").style.display = v === "bedrock" ? "" : "none";
+  document.getElementById("target-endpoint-field").style.display = v === "bedrock" ? "" : "none";
   document.getElementById("target-key").placeholder = v === "bedrock" ? "Bedrock API key (blank = AWS credentials)" : "sk-…  (optional)";
   document.getElementById("target-base-url-field").style.display = v === "custom" ? "" : "none";
   document.getElementById("target-model-field").style.display = v === "custom" ? "" : "none";
@@ -2045,6 +2097,7 @@ function onTargetTypeChange() {
   document.getElementById("target-base-url").value = "";
   document.getElementById("target-model").value = "";
   document.getElementById("target-region").value = "";
+  document.getElementById("target-endpoint").value = "";
   syncTargetTypeUI();
 }
 
