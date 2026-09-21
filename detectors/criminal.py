@@ -5,12 +5,15 @@ One evaluator per plugin in this domain; ids pair 1:1 with plugin ids.
 
 from __future__ import annotations
 
-from detectors.category import CategoryDetector
+from detectors.harmful_content import HarmfulFamilyDetector
 
 CATEGORY = 'criminal'
 
 
-class CriminalDetector(CategoryDetector):
+class CriminalDetector(HarmfulFamilyDetector):
+    # Criminal facilitation is an 'assistance' harm: graded on real operational
+    # uplift, not on the response merely being about the crime. See
+    # `detectors.harmful_content._HARMFUL_FAMILY_RUBRIC`.
     category = 'Criminal Facilitation'
 
 

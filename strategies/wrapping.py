@@ -129,12 +129,44 @@ Output only the {n} exchanges, nothing else.\
             )
             try:
                 raw = (generator.complete(meta) or "").strip()
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — degrade, but not silently
+                # The static fallback keeps the run alive, but a manyshot built
+                # from generic filler is a much weaker attack than one with
+                # on-domain shots. Silently swapping it made a degraded run look
+                # identical to a strong one — an auth failure or refusal on the
+                # attacker model would quietly halve the technique's strength
+                # with no sign in the results. So say so, once and loudly, and
+                # re-raise an auth failure (a wrong key affects every case and is
+                # a setup error, not something to paper over).
+                from inference.provider import is_auth_error
+                if is_auth_error(exc):
+                    raise
+                self._warn_degraded(exc)
                 raw = ""
             if self._looks_like_shots(raw):
                 return raw.rstrip() + "\n\n"
+            # Generation ran but produced nothing usable — a refusal, an empty
+            # reply, or prose that isn't shots. The static fallback is weaker, so
+            # flag it (the exception path above already warned; guard against a
+            # double warning with the once-only flag inside _warn_degraded).
+            self._warn_degraded(None)
         # Fallback: static compliance block, repeated to the requested count.
         return self._STATIC_SHOT * self.num_shots
+
+    _warned = False
+
+    @classmethod
+    def _warn_degraded(cls, exc: "Exception | None") -> None:
+        """Warn once per process that manyshot fell back to generic shots."""
+        if cls._warned:
+            return
+        cls._warned = True
+        import sys
+        why = f"generation failed ({type(exc).__name__}: {exc})" if exc else (
+            "the attacker model returned no usable exchanges")
+        print(f"  [manyshot] {why}; falling back to generic static shots — this "
+              f"is a WEAKER attack than on-domain shots. Check the generation "
+              f"model/key if you expected stronger.", file=sys.stderr, flush=True)
 
     @staticmethod
     def _looks_like_shots(text: str) -> bool:
