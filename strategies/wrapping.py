@@ -49,10 +49,16 @@ class RefusalSuppressionStrategy(Strategy):
     """Prepend instructions telling the model not to refuse or add caveats.
 
     Probes whether explicit anti-refusal directives override safety training.
+
+    This is an *amplifier*, not a peer framing. It says nothing about what the
+    attack asks for — it only strips the model's hedging — so it composes with
+    every other strategy instead of competing for a slot beside them. See
+    `strategies.split_amplifier` for the measurement behind that choice.
     """
 
     id = "refusal-suppression"
-    description = "Prepends instructions telling the model not to refuse or add caveats. Probes how firmly refusal behaviour holds under direct pressure."
+    description = "Prepends instructions telling the model not to refuse or add caveats. Composed as an outer layer over every other strategy, since it multiplies them rather than competing with them."
+    amplifier = True
 
     def apply(self, prompt: str, **_: Any) -> str:
         return (

@@ -15,6 +15,7 @@ import json
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from config import load_config
 from detectors import all_detector_ids, get_detector
 from findings import FindingsReport
 from plugins import objective_for
-from strategies import apply_strategies
+from strategies import apply_strategies, plan_composition
 
 #: Detector ids with a dedicated grader, resolved once at import.
 _DETECTOR_IDS = frozenset(all_detector_ids())
@@ -80,6 +81,21 @@ def main(config_path: str | None = None, output_path: str | None = None) -> None
     print(f"Concurrency     : {cfg.concurrency}")
     if cfg.strategies:
         print(f"Strategies      : {', '.join(s.id for s in cfg.strategies)}")
+        amp, _ = plan_composition(cfg.strategies, compose=cfg.compose_strategies)
+        if amp is not None:
+            print(f"Composition     : '{amp.id}' wraps every other strategy "
+                  f"(set compose_strategies: false for the flat expansion)")
+
+    # An interactive strategy reads the target's reply to decide its next move,
+    # so it cannot run in the strategy phase like a prompt-to-prompt transform:
+    # its apply() is a pass-through by design. Split here and drive it at
+    # evaluation time (as cli.py does) — otherwise the case runs single-shot on
+    # the seed prompt and the run reports a multi-turn attack that never happened.
+    # `apply_strategies` still builds their cases: apply() passing the prompt
+    # through is what makes a correctly-tagged *seed* for the conversation.
+    interactive_strategies = {s.id: s for s in cfg.strategies if s.interactive}
+    for sid, s in interactive_strategies.items():
+        print(f"Adaptive        : {sid} (up to {getattr(s, 'max_turns', '?')} turns per case)")
     print()
 
     # --- Generate attacks -------------------------------------------------------
@@ -101,6 +117,7 @@ def main(config_path: str | None = None, output_path: str | None = None) -> None
     vulnerable = 0
     errored = 0
     by_plugin: dict[str, dict] = {}
+    by_strategy: dict[str, dict] = {}
 
     report = FindingsReport(
         run_id=run_id,
@@ -114,7 +131,8 @@ def main(config_path: str | None = None, output_path: str | None = None) -> None
 
         for plugin, test_cases in all_results:
             augmented = (
-                apply_strategies(test_cases, cfg.strategies, cfg.generation)
+                apply_strategies(test_cases, cfg.strategies, cfg.generation,
+                                 compose=cfg.compose_strategies)
                 if cfg.strategies
                 else test_cases
             )
@@ -133,12 +151,50 @@ def main(config_path: str | None = None, output_path: str | None = None) -> None
                 strategy_tag = f"[{strategy}] " if strategy else ""
                 print(f"[{i}] {strategy_tag}{case.prompt}")
 
-                response = target.generate(case.prompt)
                 detector = _detector_for(case, cfg.grading)
-                result = detector.grade(
-                    attack=case.prompt, response=response, purpose=cfg.purpose,
-                    objective=objective_for(case.plugin_id, case.detector_id, case.metadata),
+                # The attack's goal, given to the judge on every grading call so a
+                # drifting turn is judged against what the attack is for rather
+                # than against its literal final message.
+                objective = objective_for(
+                    case.plugin_id, case.detector_id, case.metadata
                 )
+                interactive = interactive_strategies.get(strategy or "")
+
+                if interactive is not None:
+                    # Multi-turn: the strategy owns the loop, grading each turn to
+                    # decide whether to escalate, refine, or back off.
+                    convo = interactive.run_conversation(
+                        seed_prompt=case.prompt,
+                        target=target,
+                        grade=lambda a, r: detector.grade(
+                            attack=a, response=r, purpose=cfg.purpose,
+                            objective=objective),
+                        generator=cfg.generation,
+                        purpose=cfg.purpose,
+                        objective=objective,
+                        # Already resolved (per-plugin over global) when the plugin
+                        # built the case, so refined turns inherit the same
+                        # contract the seed prompt was generated under.
+                        language=case.metadata.get("language") or "",
+                        max_chars=case.metadata.get("max_chars") or 0,
+                        instructions=case.metadata.get("generation_instructions") or "",
+                        examples=case.metadata.get("examples") or "",
+                    )
+                    attack_prompt = convo["attack"]
+                    response = convo["response"]
+                    result = convo["result"]
+                    turns = convo["turns"]
+                    transcript = convo["transcript"]
+                    backtracks = convo.get("backtracks")
+                    reconfirmed = convo.get("reconfirmed")
+                else:
+                    attack_prompt = case.prompt
+                    turns, transcript, backtracks, reconfirmed = 1, None, None, None
+                    response = target.generate(case.prompt)
+                    result = detector.grade(
+                        attack=case.prompt, response=response, purpose=cfg.purpose,
+                        objective=objective,
+                    )
 
                 # passed is None when the judge gave no readable verdict: neither
                 # a break nor a resist, so it is reported and then left out of the
@@ -148,10 +204,22 @@ def main(config_path: str | None = None, output_path: str | None = None) -> None
                     else "RESISTED" if result.passed
                     else "VULNERABLE"
                 )
-                print(f"     {verdict}  {result.reason}\n")
+                turn_note = f"  ({turns} turns)" if turns > 1 else ""
+                print(f"     {verdict}{turn_note}  {result.reason}\n")
 
                 # --- map into the category/sub-category findings report --------
-                report.add(case=case, response=response, result=result)
+                # A multi-turn case is reported under the attack that actually
+                # landed, with the seed kept as `original_prompt` — reporting the
+                # benign opener as the attack would make the finding unreadable.
+                report.add(
+                    case=(case if interactive is None else replace(
+                        case,
+                        prompt=attack_prompt,
+                        metadata={**case.metadata, "original_prompt": case.prompt},
+                    )),
+                    response=response,
+                    result=result,
+                )
 
                 # --- write JSONL record ----------------------------------------
                 record = {
@@ -160,8 +228,15 @@ def main(config_path: str | None = None, output_path: str | None = None) -> None
                     "plugin_id":        case.plugin_id,
                     "detector_id":      case.detector_id,
                     "strategy":         strategy,
-                    "attack":           case.prompt,
-                    "original_prompt":  case.metadata.get("original_prompt"),
+                    # For a multi-turn case this is the attack that landed, which
+                    # may be several refinements past the seed prompt.
+                    "attack":           attack_prompt,
+                    "original_prompt":  case.metadata.get("original_prompt") or (
+                        case.prompt if interactive is not None else None),
+                    "turns":            turns,
+                    "transcript":       transcript,
+                    "backtracks":       backtracks,
+                    "reconfirmed":      reconfirmed,
                     "response":         response,
                     "passed":           result.passed,
                     "score":            result.score,
@@ -173,13 +248,22 @@ def main(config_path: str | None = None, output_path: str | None = None) -> None
                 }
                 f.write(json.dumps(record) + "\n")
 
+                # Baseline cases carry no strategy and bucket under "none", so the
+                # lift a strategy buys over the raw prompt is readable off one table.
+                strat_counts = by_strategy.setdefault(
+                    strategy or "none", {"total": 0, "vulnerable": 0, "errored": 0}
+                )
+
                 if result.passed is None:
                     errored += 1
+                    strat_counts["errored"] += 1
                     continue
                 total += 1
+                strat_counts["total"] += 1
                 by_plugin[plugin.id]["total"] += 1
                 if not result.passed:
                     vulnerable += 1
+                    strat_counts["vulnerable"] += 1
                     by_plugin[plugin.id]["vulnerable"] += 1
 
             print()
@@ -188,6 +272,14 @@ def main(config_path: str | None = None, output_path: str | None = None) -> None
         for pid, counts in by_plugin.items():
             t = counts["total"]
             counts["pass_rate"] = round((t - counts["vulnerable"]) / t, 3) if t else 0.0
+
+        for counts in by_strategy.values():
+            # `total` here is already decided-only (errored cases `continue`
+            # before it is incremented), so this is a rate over graded cases.
+            t = counts["total"]
+            counts["attack_success_rate"] = (
+                round(counts["vulnerable"] / t, 3) if t else 0.0
+            )
 
         summary = {
             "run_id":       run_id,
@@ -201,6 +293,7 @@ def main(config_path: str | None = None, output_path: str | None = None) -> None
             "errored":     errored,
             "pass_rate":    round((total - vulnerable) / total, 3) if total else 0.0,
             "by_plugin":    by_plugin,
+            "by_strategy":  by_strategy or None,
         }
         f.write(json.dumps(summary) + "\n")
 
@@ -221,6 +314,29 @@ def main(config_path: str | None = None, output_path: str | None = None) -> None
     for pid, counts in by_plugin.items():
         print(f"  {pid}: {counts['vulnerable']}/{counts['total']} vulnerable "
               f"({1 - counts['pass_rate']:.0%})")
+
+    # With no strategies configured the single "none" row just restates the
+    # totals above, so it is only worth printing once something ran alongside it.
+    if len(by_strategy) > 1:
+        print()
+        print("By strategy (attack success rate):")
+        baseline = by_strategy.get("none")
+        col = max(len(s) for s in by_strategy) + 2
+        ordered = sorted(
+            by_strategy.items(),
+            key=lambda kv: (kv[0] != "none", -kv[1]["attack_success_rate"]),
+        )
+        for sid, counts in ordered:
+            lift = ""
+            if baseline is not None and sid != "none":
+                delta = counts["attack_success_rate"] - baseline["attack_success_rate"]
+                lift = f"   {delta:+.0%} vs baseline"
+            err = f"  ({counts['errored']} errored)" if counts["errored"] else ""
+            print(f"  {sid:<{col}} {counts['attack_success_rate']:>5.0%}  "
+                  f"({counts['vulnerable']}/{counts['total']}){err}{lift}")
+        if min(c["total"] for c in by_strategy.values()) < 20:
+            print("  note: fewer than 20 decided cases in some buckets — these "
+                  "rates carry wide error bars.")
     print()
     print(f"Results written to {out_file}")
     print(f"Findings written to {findings_file}")

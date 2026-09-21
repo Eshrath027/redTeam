@@ -221,6 +221,15 @@ class RedTeamConfig:
     # turns a whole run into fabricated findings or silent misses, and costs four
     # calls to catch. Set `check_judge: false` to skip it.
     check_judge: bool = True
+    # Wrap every selected strategy in the amplifier (refusal-suppression) as an
+    # outer layer. Applied whether or not the amplifier is itself listed, and
+    # the number of variants per case is unchanged either way — see
+    # `strategies.plan_composition`. On by default because the composed shape
+    # measures materially stronger for the same budget. Set
+    # `compose_strategies: false` for the flat peer expansion, which is what a
+    # run being compared against an older one needs, and the way to A/B whether
+    # composition actually helps against your target.
+    compose_strategies: bool = True
     # Extra calibration transcripts for *your* domain — a list of case objects,
     # or a path to a JSON file of them. Lives in the run config so the judge is
     # calibrated on the same system the run is about. See
@@ -491,5 +500,6 @@ def load_config(
         load_prompts=data.get("load_prompts") or None,
         generate=do_generate,
         check_judge=bool(data.get("check_judge", True)),
+        compose_strategies=bool(data.get("compose_strategies", True)),
         calibration=data.get("calibration"),
     )
