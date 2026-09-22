@@ -374,7 +374,7 @@ def scan_log(run_id: str):
 class CheckJudgeRequest(BaseModel):
     config: dict[str, Any]
     samples: int = 1
-    concurrency: int = 3
+    concurrency: int = 1
 
 
 @app.get("/api/calibration")
