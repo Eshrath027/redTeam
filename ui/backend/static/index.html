@@ -927,8 +927,13 @@ button{cursor:pointer}
 
     <!-- Config tab -->
     <div class="tab-panel" id="tab-config">
-      <button class="copy-btn" onclick="copyConfig()">Copy JSON</button>
-      <textarea id="config-json" readonly></textarea>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <button class="copy-btn" onclick="copyConfig()">Copy JSON</button>
+        <button class="copy-btn" onclick="validateConfigJson()">Validate</button>
+        <button class="copy-btn" id="config-reset-btn" onclick="resetConfigToForm()" style="display:none">Reset to form</button>
+        <span id="config-status" style="font-size:12px;color:var(--text-muted)">Edit or paste a config here — it will be used for the run instead of the form.</span>
+      </div>
+      <textarea id="config-json" spellcheck="false" oninput="onConfigEdit()"></textarea>
     </div>
   </main>
 </div>
@@ -1680,9 +1685,127 @@ function buildConfig() {
 }
 
 
+// A config typed or pasted into the Config JSON tab. While set, runs use it
+// instead of the form, and form changes no longer overwrite the editor.
+let configOverride = null;
+let configError = null;
+
 function updateConfig() {
+  if (configOverride || configError) return;
   const cfg = buildConfig();
   document.getElementById('config-json').value = JSON.stringify(cfg, null, 2);
+}
+
+function setConfigStatus(msg, color) {
+  const el = document.getElementById('config-status');
+  el.textContent = msg;
+  el.style.color = color || 'var(--text-muted)';
+  document.getElementById('config-reset-btn').style.display =
+    (configOverride || configError) ? '' : 'none';
+}
+
+function onConfigEdit() {
+  const text = document.getElementById('config-json').value;
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('the config must be a JSON object { ... }');
+    }
+    // On the first paste, keep API keys already typed in the form if the pasted
+    // config has none (keys are rarely pasted along with a config).
+    if (!configOverride) {
+      for (const [id, section] of [['gen-key','generation'], ['grade-key','grading'], ['target-key','target']]) {
+        const key = document.getElementById(id).value.trim();
+        const sec = parsed[section];
+        if (key && sec && typeof sec === 'object' && !sec.api_key) sec.api_key = key;
+      }
+    }
+    configOverride = parsed;
+    configError = null;
+    setConfigStatus('Using the edited JSON for runs — form changes are ignored until you reset.', 'var(--green)');
+  } catch (e) {
+    configOverride = null;
+    configError = e.message;
+    setConfigStatus(`Invalid JSON: ${e.message}`, 'var(--accent)');
+  }
+}
+
+// Form field -> path in the config, so a field edited while the JSON override is
+// active is written into it instead of being ignored.
+const FORM_FIELD_PATHS = {
+  'gen-backend': 'generation.backend', 'gen-model': 'generation.model',
+  'gen-key': 'generation.api_key', 'gen-url': 'generation.base_url',
+  'gen-region': 'generation.region', 'gen-endpoint': 'generation.endpoint_url',
+  'grade-backend': 'grading.backend', 'grade-model': 'grading.model',
+  'grade-key': 'grading.api_key', 'grade-url': 'grading.base_url',
+  'grade-region': 'grading.region', 'grade-endpoint': 'grading.endpoint_url',
+  'grade-gated': 'grading.gated',
+  'purpose': 'target.purpose', 'target-type': 'target.type',
+  'target-name': 'target.name', 'target-key': 'target.api_key',
+  'target-base-url': 'target.base_url', 'target-model': 'target.model',
+  'target-region': 'target.region', 'target-endpoint': 'target.endpoint_url',
+  'rest-endpoint': 'target.name', 'rest-model-name': 'target.model',
+  'rest-model-id': 'target.model_id', 'rest-response-field': 'target.response_field',
+  'num-tests': 'num_tests', 'concurrency': 'concurrency', 'delay': 'delay',
+  'language': 'language', 'severity': 'severity', 'max-chars': 'max_chars_per_message',
+  'generate-prompts': 'generate', 'gen-instructions': 'generation_instructions',
+  'examples': 'examples', 'global-instructions': 'global_instructions',
+};
+
+function syncFieldIntoOverride(el) {
+  const path = FORM_FIELD_PATHS[el.id];
+  if (!configOverride || !path) return;
+  let value;
+  if (el.type === 'checkbox') value = el.checked;
+  else if (el.type === 'number') value = el.value === '' ? '' : +el.value;
+  else value = el.value.trim();
+  const keys = path.split('.');
+  let obj = configOverride;
+  for (const k of keys.slice(0, -1)) {
+    if (!obj[k] || typeof obj[k] !== 'object') obj[k] = {};
+    obj = obj[k];
+  }
+  const last = keys[keys.length - 1];
+  // An emptied field removes the key rather than writing "".
+  if (value === '' || value === false && last === 'gated') delete obj[last];
+  else obj[last] = value;
+  document.getElementById('config-json').value = JSON.stringify(configOverride, null, 2);
+  setConfigStatus(`Updated ${path} from the form — still using the edited JSON.`, 'var(--green)');
+}
+
+function resetConfigToForm() {
+  configOverride = null;
+  configError = null;
+  setConfigStatus('Edit or paste a config here — it will be used for the run instead of the form.');
+  updateConfig();
+}
+
+// The config a run will use: the edited JSON if any, else the form. Null (after
+// telling the user) when the edited JSON does not parse.
+function currentConfig() {
+  if (configError) {
+    alert(`The Config JSON tab has invalid JSON:\n\n${configError}\n\nFix it or click "Reset to form".`);
+    return null;
+  }
+  return configOverride || buildConfig();
+}
+
+async function validateConfigJson() {
+  const cfg = currentConfig();
+  if (!cfg) return;
+  setConfigStatus('Validating…');
+  try {
+    const res = await fetch(`${API}/api/config/validate`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({config: cfg}),
+    });
+    const d = await res.json();
+    if (d.valid) setConfigStatus('Config is valid.', 'var(--green)');
+    else setConfigStatus(`Invalid config: ${d.error || res.statusText}`, 'var(--accent)');
+  } catch (e) {
+    setConfigStatus(`Could not validate: ${e.message}`, 'var(--accent)');
+  }
 }
 
 function copyConfig() {
@@ -1691,7 +1814,8 @@ function copyConfig() {
 
 // ── Judge calibration ──────────────────────────────────────────────────────────
 async function checkJudge() {
-  const cfg = buildConfig();
+  const cfg = currentConfig();
+  if (!cfg) return;
   if (!cfg.grading) { alert("No grading model configured to check."); return; }
   const btns = document.querySelectorAll('#check-judge-btn, #tab-judge .run-btn');
   btns.forEach(b => { b.disabled = true; });
@@ -1785,7 +1909,8 @@ function renderJudge(d) {
 
 // ── Scan ──────────────────────────────────────────────────────────────────────
 async function startScan() {
-  const cfg = buildConfig();
+  const cfg = currentConfig();
+  if (!cfg) return;
   document.getElementById('log').innerHTML = '';
   setRunning(true);
   switchTab('run', document.querySelector('.tab'));
@@ -2108,6 +2233,9 @@ function toggleTheme() {
 
 // Live config update on any input change
 document.querySelectorAll('input,select,textarea').forEach(el => {
+  if (el.id === 'config-json') return;  // the editor itself must not be regenerated
+  el.addEventListener('change', () => syncFieldIntoOverride(el));
+  el.addEventListener('input', () => syncFieldIntoOverride(el));
   el.addEventListener('change', updateConfig);
   el.addEventListener('input', () => { if (el.tagName === 'TEXTAREA') updateConfig(); });
 });
