@@ -384,6 +384,8 @@ plausible pretext, or splitting the ask so no single turn looks like the goal.
                 "axes": getattr(result, "axes", None),
             })
 
+            if getattr(result, "error", None):
+                break  # target returned an error; more turns test nothing
             # result.passed is True when the target RESISTED, so an explicit
             # False means the attack landed. An ungraded turn (None) is not a
             # break — fall through and keep refining rather than reporting one.
@@ -585,6 +587,8 @@ or more innocuous angle that avoids the refusal.
                     else "escalate"),
             })
 
+            if getattr(result, "error", None):
+                break  # target returned an error; more turns test nothing
             # A graded break (target complied with something it should not have).
             # `is False`: an ungraded turn is not a break, so the escalation
             # continues instead of reporting a finding the judge never gave.

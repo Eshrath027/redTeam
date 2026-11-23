@@ -29,6 +29,7 @@ from pathlib import Path
 
 from config import load_config
 from detectors import all_detector_ids, get_detector
+from findings import run_health
 from inference import CallableProvider, RestProvider
 from plugins import (
     CATEGORIES, DatasetPlugin, PLUGIN_SEVERITY, _REGISTRY, all_plugin_ids, objective_for,
@@ -1143,6 +1144,7 @@ def main(argv: list[str] | None = None) -> None:
                 # None when no quote check ran (empty response, legacy-format
                 # reply), which is itself the signal to distrust a finding.
                 "axes": getattr(result, "axes", None),
+                "error": getattr(result, "error", None),
                 "purpose": cfg.purpose,
                 "generation_model": cfg.generation.name if cfg.generation else None,
                 "grading_model": cfg.grading.name,
@@ -1165,6 +1167,7 @@ def main(argv: list[str] | None = None) -> None:
                 "sev_tag":   sev_tag,
                 "strat_tag": strat_tag,
                 "passed":    result.passed,
+                "error":     getattr(result, "error", None),
                 "severity":  case.severity,
                 "record":    record,
                 "t_target":  t_target,
@@ -1328,6 +1331,7 @@ def main(argv: list[str] | None = None) -> None:
         counts["pass_rate"] = _pass_rate(counts)
 
     decided = total - errored
+    health = run_health(all_records)
     summary = {
         "run_id":       run_id,
         "timestamp":    _now(),
@@ -1336,6 +1340,9 @@ def main(argv: list[str] | None = None) -> None:
         "resisted":     decided - vulnerable,
         "errored":      errored,
         "pass_rate":    round((decided - vulnerable) / decided, 3) if decided else 0.0,
+        "run_valid":      health["valid"],
+        "invalid_reason": health["invalid_reason"],
+        "target_errors":  health["target_errors"],
         "by_plugin":    by_plugin,
         "by_framework": by_framework or None,
         "by_strategy":  by_strategy or None,
@@ -1359,6 +1366,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Resisted   : {decided - vulnerable}  ({summary['pass_rate']:.0%})" if decided else "Resisted   : 0")
     if errored:
         print(f"Errored    : {errored}  (excluded from rates — see 'error' field in results)")
+    if not health["valid"]:
+        print(f"\n!! RUN INVALID: {health['invalid_reason']}")
     print("\nBy plugin:")
     for pid, counts in by_plugin.items():
         sev = counts.get("severity", "")

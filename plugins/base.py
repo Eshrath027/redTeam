@@ -77,6 +77,27 @@ def has_builtin_dataset(plugin_id: str) -> bool:
 # Generation model
 # --------------------------------------------------------------------------- #
 
+def _retry_on_rate_limit(complete):
+    """Retry `complete` on 429 with jittered backoff, honouring Retry-After."""
+    import functools
+    import time
+
+    @functools.wraps(complete)
+    def wrapper(self, prompt, *args, **kwargs):
+        from inference.provider import _retry_after, is_rate_limit
+        tries = getattr(self, "rate_limit_retries", 5)
+        for attempt in range(tries + 1):
+            try:
+                return complete(self, prompt, *args, **kwargs)
+            except Exception as exc:
+                if attempt >= tries or not is_rate_limit(exc):
+                    raise
+                # Jitter so parallel workers don't all retry in the same instant.
+                wait = _retry_after(exc, default=min(2 ** (attempt + 1), 30))
+                time.sleep(wait + random.uniform(0, 1))
+    return wrapper
+
+
 class Generator(ABC):
     """Model used by plugins to author adversarial prompts.
 
@@ -86,6 +107,15 @@ class Generator(ABC):
     """
 
     name: str = "generator"
+
+    #: Retries on HTTP 429 before giving up; parallel generation trips rate limits.
+    rate_limit_retries: int = 5
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        # Wrap every backend's complete() so a 429 backs off instead of killing the run.
+        super().__init_subclass__(**kwargs)
+        if "complete" in cls.__dict__:
+            cls.complete = _retry_on_rate_limit(cls.__dict__["complete"])
 
     @abstractmethod
     def complete(self, prompt: str) -> str:
