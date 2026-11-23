@@ -29,7 +29,9 @@ from pathlib import Path
 
 from config import load_config
 from detectors import all_detector_ids, get_detector
+from findings import run_health
 from inference import CallableProvider, RestProvider
+from inference.provider import is_rate_limit
 from plugins import (
     CATEGORIES, DatasetPlugin, PLUGIN_SEVERITY, _REGISTRY, all_plugin_ids, objective_for,
     builtin_dataset_path, category_for_plugin, get_plugin, has_builtin_dataset,
@@ -466,7 +468,13 @@ def _generate_unique(plugin, want: int, seen: set) -> list:
                 if len(fresh) >= want:
                     break
                 plugin.num_tests = want - len(fresh) + spare
-                fresh += _unique_cases(plugin.generate_tests(), seen)
+                try:
+                    fresh += _unique_cases(plugin.generate_tests(), seen)
+                except Exception as exc:
+                    # Rate-limited on the spare pass: keep the prompts we already have.
+                    if not (fresh and is_rate_limit(exc)):
+                        raise
+                    break
             fresh = fresh[:want]
     finally:
         plugin.num_tests = orig
@@ -483,9 +491,17 @@ def _run_plugin_with_topup(plugin, file_base: list) -> tuple:
     seen = {_prompt_key(tc.prompt) for tc in file_base}
     shortfall = max(0, plugin.num_tests - len(file_base))
     generated = bool(shortfall)
-    new_cases = _generate_unique(plugin, shortfall, seen) if shortfall else []
+    skipped = None
+    try:
+        new_cases = _generate_unique(plugin, shortfall, seen) if shortfall else []
+    except Exception as exc:
+        # Generation model still rate-limited after retries: skip this plugin, not the scan.
+        if not is_rate_limit(exc):
+            raise
+        new_cases = []
+        skipped = f"generation model rate-limited (429): {' '.join(str(exc).split())[:160]}"
     elapsed = max(round(time.perf_counter() - t0, 2), 0.01) if generated else 0
-    return plugin, file_base + new_cases, elapsed
+    return plugin, file_base + new_cases, elapsed, skipped
 
 
 def _strategy_variant(case, strategy, generator, amplifier=None):
@@ -763,20 +779,27 @@ def main(argv: list[str] | None = None) -> None:
     # _run_plugin_with_topup generates only the shortfall to reach num_tests
     run_start = time.perf_counter()
     all_plugin_results: list[tuple] = []
+    skipped_plugins: dict[str, str] = {}   # plugin id → why generation gave nothing
+
+    def _record_generation(plugin, cases, gen_t, skipped):
+        all_plugin_results.append((plugin, cases))
+        if skipped and not cases:
+            skipped_plugins[plugin.id] = skipped
+            print(f"  {plugin.id:<40} 0 prompt(s)  SKIPPED: {skipped}")
+            return
+        src = "cached" if not gen_t else f"{gen_t:.1f}s"
+        plugin_strats = plugin.strategies if hasattr(plugin, 'strategies') and plugin.strategies else cfg.strategies
+        strat_info = f" + {len(plugin_strats)} strategy(ies)" if plugin_strats else ""
+        short = (f"  — only {len(cases)} unique prompt(s) available, {plugin.num_tests} asked"
+                 if len(cases) < plugin.num_tests else "")
+        print(f"  {plugin.id:<40} {len(cases)} prompt(s)  [{src}]{strat_info}{short}")
 
     print("Generating prompts...")
     if cfg.concurrency <= 1:
         for plugin in cfg.plugins:
             file_base = [tc for tc in file_cases.get(plugin.id, [])
                          if not tc.metadata.get("strategy")]
-            plugin, cases, gen_t = _run_plugin_with_topup(plugin, file_base)
-            all_plugin_results.append((plugin, cases))
-            src = "cached" if not gen_t else f"{gen_t:.1f}s"
-            plugin_strats = plugin.strategies if hasattr(plugin, 'strategies') and plugin.strategies else cfg.strategies
-            strat_info = f" + {len(plugin_strats)} strategy(ies)" if plugin_strats else ""
-            short = (f"  — only {len(cases)} unique prompt(s) available, {plugin.num_tests} asked"
-                     if len(cases) < plugin.num_tests else "")
-            print(f"  {plugin.id:<40} {len(cases)} prompt(s)  [{src}]{strat_info}{short}")
+            _record_generation(*_run_plugin_with_topup(plugin, file_base))
     else:
         with ThreadPoolExecutor(max_workers=cfg.concurrency) as pool:
             futures = {
@@ -788,15 +811,14 @@ def main(argv: list[str] | None = None) -> None:
                 for pl in cfg.plugins
             }
             for future in as_completed(futures):
-                plugin, cases, gen_t = future.result()
-                all_plugin_results.append((plugin, cases))
-                src = "cached" if not gen_t else f"{gen_t:.1f}s"
-                plugin_strats = plugin.strategies if hasattr(plugin, 'strategies') and plugin.strategies else cfg.strategies
-                strat_info = f" + {len(plugin_strats)} strategy(ies)" if plugin_strats else ""
-                short = (f"  — only {len(cases)} unique prompt(s) available, {plugin.num_tests} asked"
-                         if len(cases) < plugin.num_tests else "")
-                print(f"  {plugin.id:<40} {len(cases)} prompt(s)  [{src}]{strat_info}{short}")
+                _record_generation(*future.result())
     print(f"\n[timing] generation: {time.perf_counter() - run_start:.1f}s\n")
+
+    # Nothing to send: stop with the reason rather than write an empty results file.
+    if skipped_plugins and not any(cases for _, cases in all_plugin_results):
+        print("✗ Every plugin was skipped: the generation model stayed rate-limited "
+              "after retries. Lower --concurrency, wait for the quota to reset, or use another key.")
+        raise SystemExit(2)
 
     # --- build final case lists (apply only strategies missing from file) -----
     # For each plugin:
@@ -1143,6 +1165,7 @@ def main(argv: list[str] | None = None) -> None:
                 # None when no quote check ran (empty response, legacy-format
                 # reply), which is itself the signal to distrust a finding.
                 "axes": getattr(result, "axes", None),
+                "error": getattr(result, "error", None),
                 "purpose": cfg.purpose,
                 "generation_model": cfg.generation.name if cfg.generation else None,
                 "grading_model": cfg.grading.name,
@@ -1165,6 +1188,7 @@ def main(argv: list[str] | None = None) -> None:
                 "sev_tag":   sev_tag,
                 "strat_tag": strat_tag,
                 "passed":    result.passed,
+                "error":     getattr(result, "error", None),
                 "severity":  case.severity,
                 "record":    record,
                 "t_target":  t_target,
@@ -1328,6 +1352,7 @@ def main(argv: list[str] | None = None) -> None:
         counts["pass_rate"] = _pass_rate(counts)
 
     decided = total - errored
+    health = run_health(all_records)
     summary = {
         "run_id":       run_id,
         "timestamp":    _now(),
@@ -1336,6 +1361,10 @@ def main(argv: list[str] | None = None) -> None:
         "resisted":     decided - vulnerable,
         "errored":      errored,
         "pass_rate":    round((decided - vulnerable) / decided, 3) if decided else 0.0,
+        "run_valid":      health["valid"],
+        "invalid_reason": health["invalid_reason"],
+        "target_errors":  health["target_errors"],
+        "skipped_plugins": skipped_plugins or None,
         "by_plugin":    by_plugin,
         "by_framework": by_framework or None,
         "by_strategy":  by_strategy or None,
@@ -1359,6 +1388,11 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Resisted   : {decided - vulnerable}  ({summary['pass_rate']:.0%})" if decided else "Resisted   : 0")
     if errored:
         print(f"Errored    : {errored}  (excluded from rates — see 'error' field in results)")
+    if not health["valid"]:
+        print(f"\n!! RUN INVALID: {health['invalid_reason']}")
+    if skipped_plugins:
+        print(f"\n!! {len(skipped_plugins)} plugin(s) SKIPPED, not tested: "
+              f"{', '.join(skipped_plugins)} (generation model rate-limited)")
     print("\nBy plugin:")
     for pid, counts in by_plugin.items():
         sev = counts.get("severity", "")

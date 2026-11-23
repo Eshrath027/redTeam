@@ -55,7 +55,10 @@ input,select,textarea,button{font:inherit;color:inherit}
 button{cursor:pointer}
 
 /* ── Layout ──────────────────────────────────────────────────────────────── */
-#app{display:grid;grid-template-rows:48px 1fr;grid-template-columns:360px 1fr;height:100vh;overflow:hidden}
+#app{--sidebar-w:360px;display:grid;grid-template-rows:48px 1fr;grid-template-columns:var(--sidebar-w) 1fr;height:100vh;overflow:hidden}
+#sidebar-resizer{position:fixed;top:48px;bottom:0;left:calc(var(--sidebar-w) - 3px);width:6px;cursor:col-resize;z-index:50;background:transparent;transition:background .15s}
+#sidebar-resizer:hover,#sidebar-resizer.dragging{background:var(--accent);opacity:.6}
+body.resizing{cursor:col-resize;user-select:none}
 #header{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:0 16px;background:var(--surface);border-bottom:1px solid var(--border)}
 #sidebar{overflow-y:auto;border-right:1px solid var(--border);background:var(--surface);padding:0 0 80px}
 #main{overflow-y:auto;background:var(--bg);display:flex;flex-direction:column}
@@ -524,7 +527,8 @@ button{cursor:pointer}
     </div>
   </header>
 
-  <!-- Sidebar -->
+  <!-- Sidebar (drag the right edge to resize, double-click to reset) -->
+  <div id="sidebar-resizer" title="Drag to resize · double-click to reset"></div>
   <aside id="sidebar">
 
     <!-- Target -->
@@ -2019,6 +2023,8 @@ function renderResults(data) {
     <div class="results-toolbar">
       <button class="copy-btn" onclick="downloadResultsJSON()">⬇ Download Results JSON</button>
     </div>
+    ${s.run_valid === false ? `<div class="reason-row why-err" style="padding:10px;border-radius:8px;margin:8px 0"><span class="reason-lbl">RUN INVALID</span> ${esc(s.invalid_reason || '')} Fix the target configuration and re-run.</div>` : ''}
+    ${s.skipped_plugins ? `<div class="reason-row why-err" style="padding:10px;border-radius:8px;margin:8px 0"><span class="reason-lbl">INCOMPLETE</span> ${Object.keys(s.skipped_plugins).length} plugin(s) were not tested because the generation model stayed rate-limited: ${esc(Object.keys(s.skipped_plugins).join(', '))}. Lower Parallel Workers or wait for the quota to reset, then re-run.</div>` : ''}
 
     <div class="results-grid">
       <div class="stat-card"><div class="num">${s.total||0}</div><div class="lbl">Total cases</div></div>
@@ -2787,6 +2793,29 @@ function saveFrameworkCustomization(frameworkKey) {
 
 // Call on init
 loadCategories();
+
+// Resizable sidebar: width clamped to 260px..70% of viewport, remembered per browser.
+(function initSidebarResize() {
+  const app = document.getElementById('app'), handle = document.getElementById('sidebar-resizer');
+  const DEFAULT_W = 360, MIN_W = 260;
+  const clamp = w => Math.max(MIN_W, Math.min(w, Math.round(window.innerWidth * 0.7)));
+  const setW = w => app.style.setProperty('--sidebar-w', clamp(w) + 'px');
+  try { const saved = parseInt(localStorage.getItem('knoxrt.sidebarW'), 10); if (saved) setW(saved); } catch (e) {}
+
+  handle.addEventListener('mousedown', e => {
+    e.preventDefault();
+    handle.classList.add('dragging'); document.body.classList.add('resizing');
+    const onMove = ev => setW(ev.clientX);
+    const onUp = () => {
+      handle.classList.remove('dragging'); document.body.classList.remove('resizing');
+      document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp);
+      try { localStorage.setItem('knoxrt.sidebarW', parseInt(getComputedStyle(app).getPropertyValue('--sidebar-w'), 10)); } catch (e) {}
+    };
+    document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp);
+  });
+  handle.addEventListener('dblclick', () => { setW(DEFAULT_W); try { localStorage.removeItem('knoxrt.sidebarW'); } catch (e) {} });
+  window.addEventListener('resize', () => setW(parseInt(getComputedStyle(app).getPropertyValue('--sidebar-w'), 10) || DEFAULT_W));
+})();
 
 </script>
 </body>

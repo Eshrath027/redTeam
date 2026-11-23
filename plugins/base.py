@@ -77,6 +77,30 @@ def has_builtin_dataset(plugin_id: str) -> bool:
 # Generation model
 # --------------------------------------------------------------------------- #
 
+def retry_on_rate_limit(fn):
+    """Retry a model-call method on 429 with jittered backoff, honouring Retry-After.
+
+    Shared by Generator and Judge backends.
+    """
+    import functools
+    import time
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        from inference.provider import _retry_after, is_rate_limit
+        tries = getattr(self, "rate_limit_retries", 5)
+        for attempt in range(tries + 1):
+            try:
+                return fn(self, *args, **kwargs)
+            except Exception as exc:
+                if attempt >= tries or not is_rate_limit(exc):
+                    raise
+                # Jitter so parallel workers don't all retry in the same instant.
+                wait = _retry_after(exc, default=min(2 ** (attempt + 1), 30))
+                time.sleep(wait + random.uniform(0, 1))
+    return wrapper
+
+
 class Generator(ABC):
     """Model used by plugins to author adversarial prompts.
 
@@ -86,6 +110,15 @@ class Generator(ABC):
     """
 
     name: str = "generator"
+
+    #: Retries on HTTP 429 before giving up; parallel generation trips rate limits.
+    rate_limit_retries: int = 5
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        # Wrap every backend's complete() so a 429 backs off instead of killing the run.
+        super().__init_subclass__(**kwargs)
+        if "complete" in cls.__dict__:
+            cls.complete = retry_on_rate_limit(cls.__dict__["complete"])
 
     @abstractmethod
     def complete(self, prompt: str) -> str:
@@ -264,15 +297,25 @@ class RedteamPlugin(ABC):
         and collects results as they arrive, cancelling the rest once enough
         unique prompts have been gathered.
         """
+        from inference.provider import is_rate_limit
+
         seen: set[str] = set()
         cases: list[TestCase] = []
+        # A call still rate-limited after its retries: keep what we have, re-raise only if nothing.
+        limited: Exception | None = None
 
         if self.concurrency <= 1:
             attempts = 0
             while len(cases) < self.num_tests and attempts < self.max_attempts:
                 attempts += 1
                 remaining = self.num_tests - len(cases)
-                raw = self.generator.complete(self._render(remaining))
+                try:
+                    raw = self.generator.complete(self._render(remaining))
+                except Exception as exc:
+                    if not is_rate_limit(exc):
+                        raise
+                    limited = exc
+                    break
                 for prompt in self._parse(raw):
                     key = prompt.strip().lower()
                     if not key or key in seen or is_basic_refusal(prompt):
@@ -281,6 +324,8 @@ class RedteamPlugin(ABC):
                     cases.append(self._build_test_case(prompt))
                     if len(cases) >= self.num_tests:
                         break
+            if limited and not cases:
+                raise limited
             return cases[: self.num_tests]
 
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
@@ -289,7 +334,13 @@ class RedteamPlugin(ABC):
                 for _ in range(self.max_attempts)
             ]
             for future in as_completed(futures):
-                raw = future.result()
+                try:
+                    raw = future.result()
+                except Exception as exc:
+                    if not is_rate_limit(exc):
+                        raise
+                    limited = exc
+                    continue
                 for prompt in self._parse(raw):
                     key = prompt.strip().lower()
                     if not key or key in seen or is_basic_refusal(prompt):
@@ -301,6 +352,8 @@ class RedteamPlugin(ABC):
                         f.cancel()
                     break
 
+        if limited and not cases:
+            raise limited
         return cases[: self.num_tests]
 
     # ---- helpers ----------------------------------------------------------

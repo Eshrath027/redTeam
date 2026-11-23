@@ -29,12 +29,23 @@ from collections import deque
 from typing import Any, Iterable
 
 from detectors.schema import JSON_OBJECT_FORMAT as _JSON_OBJECT
+from plugins.base import retry_on_rate_limit
 
 
 class Judge(ABC):
     """LLM-as-a-judge model. Subclass and implement `evaluate()`."""
 
     name: str = "judge"
+
+    #: Retries on HTTP 429 before giving up; otherwise the case is recorded as errored.
+    rate_limit_retries: int = 5
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        # Same 429 backoff as Generator, on every backend's model-call methods.
+        super().__init_subclass__(**kwargs)
+        for meth in ("evaluate", "evaluate_messages"):
+            if meth in cls.__dict__:
+                setattr(cls, meth, retry_on_rate_limit(cls.__dict__[meth]))
 
     #: True when this backend can be asked for schema-constrained output, i.e.
     #: `evaluate()` accepts a `response_format` keyword. Callers check this flag
