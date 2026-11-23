@@ -297,15 +297,25 @@ class RedteamPlugin(ABC):
         and collects results as they arrive, cancelling the rest once enough
         unique prompts have been gathered.
         """
+        from inference.provider import is_rate_limit
+
         seen: set[str] = set()
         cases: list[TestCase] = []
+        # A call still rate-limited after its retries: keep what we have, re-raise only if nothing.
+        limited: Exception | None = None
 
         if self.concurrency <= 1:
             attempts = 0
             while len(cases) < self.num_tests and attempts < self.max_attempts:
                 attempts += 1
                 remaining = self.num_tests - len(cases)
-                raw = self.generator.complete(self._render(remaining))
+                try:
+                    raw = self.generator.complete(self._render(remaining))
+                except Exception as exc:
+                    if not is_rate_limit(exc):
+                        raise
+                    limited = exc
+                    break
                 for prompt in self._parse(raw):
                     key = prompt.strip().lower()
                     if not key or key in seen or is_basic_refusal(prompt):
@@ -314,6 +324,8 @@ class RedteamPlugin(ABC):
                     cases.append(self._build_test_case(prompt))
                     if len(cases) >= self.num_tests:
                         break
+            if limited and not cases:
+                raise limited
             return cases[: self.num_tests]
 
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
@@ -322,7 +334,13 @@ class RedteamPlugin(ABC):
                 for _ in range(self.max_attempts)
             ]
             for future in as_completed(futures):
-                raw = future.result()
+                try:
+                    raw = future.result()
+                except Exception as exc:
+                    if not is_rate_limit(exc):
+                        raise
+                    limited = exc
+                    continue
                 for prompt in self._parse(raw):
                     key = prompt.strip().lower()
                     if not key or key in seen or is_basic_refusal(prompt):
@@ -334,6 +352,8 @@ class RedteamPlugin(ABC):
                         f.cancel()
                     break
 
+        if limited and not cases:
+            raise limited
         return cases[: self.num_tests]
 
     # ---- helpers ----------------------------------------------------------

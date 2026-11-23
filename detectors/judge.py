@@ -37,7 +37,7 @@ class Judge(ABC):
 
     name: str = "judge"
 
-    #: Retries on HTTP 429 before giving up; a rate-limited case was silently dropped.
+    #: Retries on HTTP 429 before giving up; otherwise the case is recorded as errored.
     rate_limit_retries: int = 5
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
